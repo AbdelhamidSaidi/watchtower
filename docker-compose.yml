@@ -1,0 +1,309 @@
+# Watchtower DEV stack -- the fast inner loop on one machine.
+#
+#   producer -> kafka -> pipeline (spark, local mode) -> clickhouse
+#                  \-> schema-registry (karapace)
+#
+# Kubernetes (deploy/k8s) is the scalable deployment. This file exists so a
+# code change can be tried in seconds: ./etl and ./schemas are mounted over
+# the image, so edits need a pipeline restart, not a rebuild.
+#
+# Versions match the Kubernetes deployment exactly (Kafka 4.3.1, the same
+# Spark image), so "works in dev" means something in staging.
+#
+#   make secrets     once, before first start
+#   make dev-up      start everything
+#   make produce     synthetic traffic from the host
+#   docker compose --profile sim up -d   ...or the producer as a container
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: watchtower-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init, never by a stray client.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      # Without this the broker writes to /tmp/kafka-logs inside the
+      # container and the volume below holds nothing.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx320m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    # A port check, not kafka-broker-api-versions.sh: that starts a whole
+    # JVM (~200 MB, a CPU burst) every 10 s, forever -- on a ~4 GB VM that
+    # was part of what pushed it into swap.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # One-shot: the topics, with the same 6 partitions staging uses.
+  #   security-logs           raw events in (producer -> Flink)
+  #   security-events-scored  finished rows out (Flink -> ClickHouse)
+  #   security-logs-rejected  dead letters out (Flink -> ClickHouse)
+  kafka-init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for topic in security-logs security-events-scored security-logs-rejected; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+            --topic "$$topic" --partitions 6 --replication-factor 1 --config retention.ms=86400000
+        done
+        # Record timestamps = broker append time, not the source's clock:
+        # the job's Kafka -> decision latency metric starts there.
+        /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka:29092 --alter --entity-type topics \
+          --entity-name security-logs --add-config message.timestamp.type=LogAppendTime
+    restart: "no"
+
+  # Karapace (Aiven, Apache-2.0): Confluent-API-compatible, same `_schemas`
+  # topic, same endpoints. Chosen over cp-schema-registry for footprint --
+  # 563 MB vs 2,180 MB compressed -- with no change to any client code.
+  schema-registry:
+    image: ghcr.io/aiven-open/karapace:6.2.3
+    container_name: watchtower-schema-registry
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    entrypoint: ["python3", "-m", "karapace"]
+    ports:
+      - "8081:8081"
+    environment:
+      KARAPACE_KARAPACE_REGISTRY: "true"
+      KARAPACE_HOST: 0.0.0.0
+      KARAPACE_PORT: 8081
+      KARAPACE_ADVERTISED_HOSTNAME: schema-registry
+      KARAPACE_ADVERTISED_PROTOCOL: http
+      KARAPACE_BOOTSTRAP_URI: kafka:29092
+      KARAPACE_CLIENT_ID: karapace-0
+      KARAPACE_GROUP_ID: karapace
+      KARAPACE_MASTER_ELIGIBILITY: "true"
+      KARAPACE_MASTER_ELECTION_STRATEGY: highest
+      KARAPACE_TOPIC_NAME: _schemas
+      KARAPACE_REPLICATION_FACTOR: 1
+      KARAPACE_COMPATIBILITY: BACKWARD
+      KARAPACE_LOG_LEVEL: WARNING
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/subjects', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 18
+      start_period: 20s
+
+  # One-shot: the only path by which a schema reaches the registry.
+  schema-init:
+    image: watchtower/spark:3.5.9
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    command: ["python3", "/opt/watchtower/tools/schema_registry.py", "register", "--url", "http://schema-registry:8081"]
+    volumes:
+      - ./schemas:/opt/watchtower/schemas:ro
+      - ./tools:/opt/watchtower/tools:ro
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33
+    container_name: watchtower-clickhouse
+    ports:
+      - "8123:8123"   # HTTP  (clickhouse-connect, curl, UI)
+      - "9000:9000"   # native (clickhouse-client)
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      CLICKHOUSE_DB: watchtower
+      CLICKHOUSE_USER: watchtower
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      # the {kafka_brokers} macro in 03_streaming_ingest.sql
+      WATCHTOWER_KAFKA_BROKERS: kafka:29092
+    # The image reads its password from an env var only, so it is exported
+    # from the mounted secret inside the container -- never written into
+    # this file or visible in `docker inspect`.
+    entrypoint: ["/bin/sh", "-c", "export CLICKHOUSE_PASSWORD=\"$$(cat /run/secrets/clickhouse_password)\" && exec /entrypoint.sh"]
+    secrets:
+      - clickhouse_password
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - ./clickhouse/config/streaming.xml:/etc/clickhouse-server/config.d/streaming.xml:ro
+      - ./clickhouse/config/dev-limits.xml:/etc/clickhouse-server/config.d/dev-limits.xml:ro
+    ulimits:
+      # ClickHouse refuses to start with the default Docker fd limit.
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user watchtower --password \"$$(cat /run/secrets/clickhouse_password)\" --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # --- the live path: Flink, one event at a time ----------------------------
+  # Application mode: the JobManager runs the job and nothing else. It
+  # resumes from the newest checkpoint on restart (docker/flink/run-job.sh).
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: docker/flink/Dockerfile
+      target: runtime
+    image: watchtower/flink:2.2.1
+    container_name: watchtower-flink-jobmanager
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    command: ["/opt/watchtower/run-job.sh"]
+    # FLINK_PROPERTIES is appended verbatim to Flink's config -- comments
+    # inside it become (bogus) keys, so they live here:
+    #   parallelism: FLINK_PARALLELISM=N with N TaskManagers, e.g.
+    #     FLINK_PARALLELISM=2 docker compose up -d --scale flink-taskmanager=2
+    #   numberOfTaskSlots 1: in thread mode all slots of a TaskManager share
+    #     one Python interpreter and its GIL. Measured at 1,000 events/sec
+    #     in: 1 slot ~1,300-2,000/sec, 2 slots ~1,150, 4 slots ~450. Scale
+    #     out with TaskManagers (Kubernetes: 1 slot per pod).
+    #   managed.fraction 0.05: heap state + thread mode use no managed
+    #     memory; Flink's default 40% would sit idle.
+    environment: &flink-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      WATCHTOWER_PYTHON_EXECUTION_MODE: ${WATCHTOWER_PYTHON_EXECUTION_MODE:-thread}
+      WATCHTOWER_PYTHON_BUNDLE_MS: ${WATCHTOWER_PYTHON_BUNDLE_MS:-5}
+      WATCHTOWER_CHECKPOINT_INTERVAL_MS: ${WATCHTOWER_CHECKPOINT_INTERVAL_MS:-10000}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 640m
+        taskmanager.memory.process.size: 1280m
+        taskmanager.numberOfTaskSlots: 1
+        parallelism.default: ${FLINK_PARALLELISM:-1}
+        taskmanager.memory.managed.fraction: 0.05
+        state.backend.type: hashmap
+        execution.checkpointing.dir: file:///var/lib/watchtower/flink-checkpoints
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        execution.checkpointing.num-retained: 2
+        restart-strategy.type: exponential-delay
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+        rest.flamegraph.enabled: true
+    ports:
+      - "8082:8081"   # Flink UI
+      - "9249:9249"   # /metrics (JobManager)
+    volumes:
+      - ./etl:/opt/watchtower/etl:ro
+      - ./schemas:/opt/watchtower/schemas:ro
+      - flink-checkpoints:/var/lib/watchtower/flink-checkpoints
+    restart: unless-stopped
+
+  flink-taskmanager:
+    image: watchtower/flink:2.2.1
+    # no container_name: TaskManagers scale (--scale flink-taskmanager=N)
+    depends_on:
+      - flink-jobmanager
+    command: ["taskmanager"]
+    environment: *flink-env
+    ports:
+      - "9250-9257:9249"   # /metrics, one host port per TaskManager (9250 = the first)
+    volumes:
+      - ./etl:/opt/watchtower/etl:ro
+      - ./schemas:/opt/watchtower/schemas:ro
+      - flink-checkpoints:/var/lib/watchtower/flink-checkpoints
+    restart: unless-stopped
+
+  # --- the micro-batch path: Spark. Replays and backfills; not run by default.
+  #     docker compose --profile spark up pipeline
+  pipeline:
+    profiles: [spark]
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+      target: runtime
+    image: watchtower/spark:3.5.9
+    container_name: watchtower-pipeline
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    # Sized for 1,000 events/sec: 20,000 rows per 20 s batch. 4 cores and 8
+    # shuffle partitions spread ~1,780 source IPs across the stateful stage.
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=local[4]
+      - --driver-memory=1536m
+      - /opt/watchtower/etl/pipeline.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CLICKHOUSE_HOST: clickhouse
+      # Secrets as files: config.read_secret() reads *_FILE first.
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+      GROQ_API_KEY_FILE: /run/secrets/groq_api_key
+      WATCHTOWER_TRIGGER: 20 seconds
+      WATCHTOWER_SHUFFLE_PARTITIONS: 8
+      # 3x one trigger's worth at 1,000/sec, so a slow batch is caught up
+      # instead of the pipeline trailing by exactly its own capacity forever.
+      KAFKA_MAX_OFFSETS_PER_TRIGGER: 60000
+    secrets:
+      - clickhouse_password
+      - groq_api_key
+    ports:
+      - "9108:9108"   # /metrics
+      - "4040:4040"   # Spark UI
+    volumes:
+      # Dev: the working tree, mounted over the code baked into the image.
+      - ./etl:/opt/watchtower/etl:ro
+      - ./schemas:/opt/watchtower/schemas:ro
+      # Durable checkpoints: offsets + state survive a container restart.
+      - checkpoints:/var/lib/watchtower/checkpoints
+    # A dead query makes the driver exit; this restarts it, and it resumes
+    # from the checkpoint above. Restart + durable checkpoint = recovery.
+    restart: unless-stopped
+
+  producer:
+    profiles: [sim]
+    build:
+      context: .
+      dockerfile: docker/producer/Dockerfile
+    image: watchtower/producer:1.0
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKER: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      LOGS_PER_SECOND: 1000
+    restart: unless-stopped
+
+secrets:
+  clickhouse_password:
+    file: ./secrets/clickhouse_password
+  groq_api_key:
+    file: ./secrets/groq_api_key
+
+volumes:
+  kafka-data:
+  clickhouse-data:
+  checkpoints:
+  flink-checkpoints:

@@ -1,0 +1,11 @@
+# For running the ETL OUTSIDE the container (local development).
+#
+# Needs a JDK that Spark supports -- 17 or 21. Java 25 is fine for Spark
+# 4.x but not for the 3.5.9 pinned here, and anything newer is unsupported
+# by both.
+
+-r requirements.txt
+
+# Must match the cluster version in docker-compose.yml exactly, or local
+# runs and cluster runs can behave differently.
+pyspark==3.5.9

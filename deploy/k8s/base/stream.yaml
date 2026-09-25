@@ -1,0 +1,145 @@
+# The live path: the Flink streaming job (etl/stream/job.py), run by the
+# Flink Kubernetes Operator (deploy/k8s/scripts/install-flink-operator.sh).
+#
+# CAPACITY. One TaskManager (one slot, one Python interpreter) decides
+# ~4,100 events/s reading from Kafka; capacity grows by adding TaskManagers,
+# never slots (docs/streaming.md). Prod starts at 5 for 10,000 events/s.
+#
+# AUTOSCALING. The operator's job autoscaler watches every operator's busy
+# time and the Kafka source's backlog, computes the parallelism each one
+# needs to keep up (target: 60% busy), and applies it. TaskManager pods are
+# created and removed to match -- one slot each, so pods follow parallelism
+# one for one. The Kafka source never goes above the topic's partition
+# count; the keyed detection operator is capped by pipeline.max-parallelism.
+#
+# STATE. Checkpoints (Kafka offsets + every source's window and dedup
+# memory) every 10 s to the flink-data volume. `upgradeMode: last-state`
+# with Kubernetes HA: a redeploy, a rescale or a crashed JobManager all
+# resume from the newest checkpoint.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flink
+---
+# What the JobManager needs: create/delete its TaskManager pods, and keep
+# HA leader state in ConfigMaps.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flink
+rules:
+  - apiGroups: [""]
+    resources: [pods, configmaps, services, persistentvolumeclaims]
+    verbs: [create, get, list, watch, update, patch, delete, deletecollection]
+  - apiGroups: [apps]
+    resources: [deployments, deployments/finalizers]
+    verbs: [get, list, watch, update, patch, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create, get, list, watch, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flink
+subjects:
+  - kind: ServiceAccount
+    name: flink
+roleRef:
+  kind: Role
+  name: flink
+  apiGroup: rbac.authorization.k8s.io
+---
+# Checkpoints, savepoints and HA metadata. ReadWriteOnce works while every
+# Flink pod shares the single k3d node; across nodes this becomes object
+# storage (s3://) -- see docs/context.md.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flink-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: stream
+spec:
+  image: watchtower/flink:2.2.1
+  imagePullPolicy: IfNotPresent
+  flinkVersion: v2_2
+  serviceAccount: flink
+  flinkConfiguration:
+    # ONE slot per TaskManager: in thread mode (etl/config.py) all slots of
+    # a TaskManager share one Python interpreter and its GIL. Measured: 1
+    # slot ~2,000 events/s with full windows; 2 slots ~1,150/s; 4 slots
+    # ~450/s. Capacity grows by adding TaskManagers, which the autoscaler
+    # does.
+    taskmanager.numberOfTaskSlots: "1"
+    # Managed memory serves RocksDB and PyFlink's PROCESS mode -- neither is
+    # used here (heap state backend, thread mode), and the default 40% would
+    # leave a 1 GiB TaskManager ~100 MB of heap for all its keyed state.
+    taskmanager.memory.managed.fraction: "0.05"
+    # Key groups: the most the keyed operator can ever be spread over.
+    # Fixed for the life of the checkpoints -- raise only with a reset.
+    pipeline.max-parallelism: "24"
+    state.backend.type: hashmap
+    execution.checkpointing.dir: file:///flink-data/checkpoints
+    execution.checkpointing.savepoint-dir: file:///flink-data/savepoints
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    high-availability.type: kubernetes
+    high-availability.storageDir: file:///flink-data/ha
+    restart-strategy.type: exponential-delay
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+    # --- autoscaler ------------------------------------------------------
+    job.autoscaler.enabled: "true"
+    job.autoscaler.metrics.window: 3m
+    job.autoscaler.stabilization.interval: 1m
+    job.autoscaler.target.utilization: "0.6"
+    job.autoscaler.target.utilization.boundary: "0.2"
+    # A backlog must be worked off within this -- the autoscaler sizes for
+    # the input rate PLUS the catch-up, not the input rate alone.
+    job.autoscaler.catch-up.duration: 2m
+    job.autoscaler.restart.time: 30s
+    job.autoscaler.scale-down.interval: 10m
+    # Overlays set the ceiling (staging: what one ~4 GB node holds).
+    job.autoscaler.vertex.max-parallelism: "6"
+  podTemplate:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9249"
+    spec:
+      securityContext:
+        fsGroup: 9999          # the image's flink user
+      containers:
+        - name: flink-main-container
+          envFrom:
+            - configMapRef:
+                name: pipeline-env
+          volumeMounts:
+            - name: flink-data
+              mountPath: /flink-data
+      volumes:
+        - name: flink-data
+          persistentVolumeClaim:
+            claimName: flink-data
+  jobManager:
+    resource:
+      memory: 768m
+      cpu: 0.25
+  taskManager:
+    resource:
+      memory: 1024m
+      cpu: 0.5
+  job:
+    jarURI: local:///opt/flink/opt/flink-python-2.2.1.jar
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args: ["-py", "/opt/watchtower/etl/stream/job.py"]
+    parallelism: 1
+    upgradeMode: last-state
+    state: running

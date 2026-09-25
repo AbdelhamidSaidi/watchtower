@@ -1,0 +1,3 @@
+# Producer dependencies. Runs on the host (dev) and in its own container (k8s).
+kafka-python==3.0.11
+fastavro==1.12.2

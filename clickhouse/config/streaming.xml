@@ -1,0 +1,14 @@
+<!-- Per-environment values for the streaming ingest (03_streaming_ingest.sql).
+     The {kafka_brokers} macro takes its value from the environment, so one
+     SQL file serves compose (kafka:29092) and Kubernetes (the Strimzi
+     bootstrap service). -->
+<clickhouse>
+    <macros>
+        <kafka_brokers from_env="WATCHTOWER_KAFKA_BROKERS"/>
+    </macros>
+    <kafka>
+        <!-- Low-latency consumer: a fetch returns as soon as there is
+             anything, or after 10 ms. -->
+        <fetch_wait_max_ms>10</fetch_wait_max_ms>
+    </kafka>
+</clickhouse>

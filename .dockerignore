@@ -1,0 +1,12 @@
+# Never send these into an image build context.
+.git
+secrets/
+.env
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+deploy/
+docs/
+*.md
+!README.md

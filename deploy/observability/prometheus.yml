@@ -1,0 +1,84 @@
+# Prometheus scrape config for the Kubernetes deployment.
+#
+# Discovers pods in its OWN namespace only, so the same file serves staging
+# and prod without edits and neither environment scrapes the other.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # The Flink streaming job (the live path): JobManager and every
+  # TaskManager the autoscaler has started. Labels set by the Flink
+  # operator: app=<FlinkDeployment name>, component=jobmanager|taskmanager.
+  - job_name: watchtower-stream
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_type]
+        regex: flink-native-kubernetes
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: "$1:9249"
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_component]
+        target_label: component
+
+  # The Spark driver's /metrics (etl/observability/metrics.py) -- only when
+  # the optional Spark component is deployed.
+  - job_name: watchtower-pipeline
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: pipeline
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: "$1:9108"
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+  # Kafka brokers and controllers (JMX exporter on 9404, added by Strimzi).
+  - job_name: kafka
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_strimzi_io_kind]
+        regex: Kafka
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_label_strimzi_io_pool_name]
+        regex: (brokers|controllers)
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: "$1:9404"
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_strimzi_io_pool_name]
+        target_label: pool
+
+  - job_name: clickhouse
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: clickhouse
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: "$1:9363"
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod

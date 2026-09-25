@@ -1,0 +1,54 @@
+# Synthetic company traffic. Waits for the schema to be registered, because
+# the producer refuses to start with an unregistered schema -- by design.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      initContainers:
+        - name: wait-for-schema
+          image: watchtower/producer:1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -c
+            - |
+              import time, urllib.request
+              url = "http://schema-registry:8081/subjects/security-logs-value/versions/latest"
+              for attempt in range(120):
+                  try:
+                      urllib.request.urlopen(url, timeout=5)
+                      print("schema registered"); break
+                  except Exception as exc:
+                      print(f"waiting for schema ({exc})", flush=True); time.sleep(5)
+              else:
+                  raise SystemExit("schema never registered")
+      containers:
+        - name: producer
+          image: watchtower/producer:1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: KAFKA_BROKER
+              value: watchtower-kafka-bootstrap:9092
+            - name: SCHEMA_REGISTRY_URL
+              value: http://schema-registry:8081
+            - name: LOGS_PER_SECOND
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-env
+                  key: LOGS_PER_SECOND
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 100m
+            limits:
+              memory: 160Mi

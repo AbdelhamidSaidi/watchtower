@@ -1,0 +1,53 @@
+# Staging: production-shaped traffic -- the 1,780-host simulation at 1,000
+# logs/sec -- on a single ~4 GB node, with the scaling of prod: Flink
+# TaskManagers and Kafka brokers both scale on demand (1..3 TaskManagers,
+# 1..2 brokers). What fits on the node is the real ceiling; beyond it, new pods
+# wait Pending, exactly as they would on a full cluster without a node
+# autoscaler.
+#
+# This is where every change runs before prod: `make promote` refuses to
+# deploy prod unless the staging smoke test passes.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: watchtower-staging
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+configMapGenerator:
+  - name: pipeline-env
+    behavior: merge
+    literals:
+      - LOGS_PER_SECOND=1000
+      # Used only if the Spark component is added (components/spark-pipeline)
+      - SPARK_EXECUTORS=auto
+      - SPARK_MIN_EXECUTORS=1
+      - SPARK_MAX_EXECUTORS=3
+      - SPARK_DRIVER_MEMORY=512m
+      - WATCHTOWER_SHUFFLE_PARTITIONS=6
+      - KAFKA_MAX_OFFSETS_PER_TRIGGER=60000
+
+patches:
+  # One ~4 GB node: at most 3 TaskManagers (1 GiB each) next to Kafka,
+  # ClickHouse and the rest. Beyond that, pods would only wait Pending.
+  - target: {kind: FlinkDeployment, name: stream}
+    patch: |-
+      apiVersion: flink.apache.org/v1beta1
+      kind: FlinkDeployment
+      metadata:
+        name: stream
+      spec:
+        flinkConfiguration:
+          job.autoscaler.vertex.max-parallelism: "3"
+
+  - target: {kind: HorizontalPodAutoscaler, name: kafka-brokers}
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: kafka-brokers
+      spec:
+        minReplicas: 1
+        maxReplicas: 2

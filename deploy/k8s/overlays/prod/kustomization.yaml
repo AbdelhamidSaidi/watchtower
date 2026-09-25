@@ -1,0 +1,176 @@
+# Prod: the real shape. 3 KRaft controllers (a quorum that survives losing
+# one), 3 to 6 brokers scaled on demand, replication factor 3 with min.insync.replicas=2 (a write
+# is acknowledged only once it exists on two brokers), and the Flink job
+# autoscaled across 2 to 12 TaskManagers.
+#
+# Needs roughly 7-8 GB for the Docker VM -- more than this laptop has. It
+# is the deployable definition of prod; staging is what runs here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: watchtower-prod
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+configMapGenerator:
+  - name: pipeline-env
+    behavior: merge
+    literals:
+      - SPARK_EXECUTORS=auto
+      - SPARK_MIN_EXECUTORS=2
+      - SPARK_MAX_EXECUTORS=8
+      - SPARK_EXECUTOR_MEMORY=1g
+      - SPARK_EXECUTOR_MEMORY_OVERHEAD=768m
+      - SPARK_EXECUTOR_CORES=2
+      - SPARK_EXECUTOR_REQUEST_CORES=1000m
+      - SPARK_DRIVER_MEMORY=1g
+      # 8 executors x 2 cores = 16 slots: a batch needs at least 16 tasks
+      # for the top of the range to be used at all.
+      - KAFKA_MIN_PARTITIONS=16
+      - WATCHTOWER_SHUFFLE_PARTITIONS=16
+      - WATCHTOWER_ROCKSDB_MEMORY_MB=384
+      - WATCHTOWER_TRIGGER=10 seconds
+
+patches:
+  - target: {kind: KafkaNodePool, name: controllers}
+    patch: |-
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaNodePool
+      metadata:
+        name: controllers
+      spec:
+        replicas: 3
+
+  - target: {kind: KafkaNodePool, name: brokers}
+    patch: |-
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaNodePool
+      metadata:
+        name: brokers
+      spec:
+        replicas: 3
+        jvmOptions:
+          -Xms: 1g
+          -Xmx: 1g
+        resources:
+          requests: {memory: 2Gi, cpu: "1"}
+          limits: {memory: 2Gi}
+
+  - target: {kind: Kafka, name: watchtower}
+    patch: |-
+      apiVersion: kafka.strimzi.io/v1
+      kind: Kafka
+      metadata:
+        name: watchtower
+      spec:
+        kafka:
+          config:
+            offsets.topic.replication.factor: 3
+            transaction.state.log.replication.factor: 3
+            transaction.state.log.min.isr: 2
+            default.replication.factor: 3
+            min.insync.replicas: 2
+            cruise.control.metrics.topic.replication.factor: 3
+            cruise.control.metrics.topic.min.insync.replicas: 2
+
+  # The job's output topics need prod's replication too: with the cluster at
+  # min.insync.replicas=2, a 1-replica topic refuses every acks=all write --
+  # and the Flink Kafka sink writes with acks=all.
+  - target: {kind: KafkaTopic, name: security-events-scored}
+    patch: |-
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaTopic
+      metadata:
+        name: security-events-scored
+      spec:
+        partitions: 12        # 5 to 24 TaskManagers write here
+        replicas: 3
+        config:
+          min.insync.replicas: 2
+
+  - target: {kind: KafkaTopic, name: security-logs-rejected}
+    patch: |-
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaTopic
+      metadata:
+        name: security-logs-rejected
+      spec:
+        replicas: 3
+        config:
+          min.insync.replicas: 2
+
+  # 10,000 events/s: ~20 inserts/s of ~500 rows, and the merges behind them.
+  - target: {kind: StatefulSet, name: clickhouse}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: clickhouse
+      spec:
+        template:
+          spec:
+            containers:
+              - name: clickhouse
+                resources:
+                  requests: {memory: 4Gi, cpu: "2"}
+                  limits: {memory: 4Gi}
+
+  - target: {kind: HorizontalPodAutoscaler, name: kafka-brokers}
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: kafka-brokers
+      spec:
+        minReplicas: 3        # never below the replication factor
+        maxReplicas: 6
+
+  - target: {kind: KafkaTopic, name: security-logs}
+    patch: |-
+      apiVersion: kafka.strimzi.io/v1
+      kind: KafkaTopic
+      metadata:
+        name: security-logs
+      spec:
+        partitions: 24        # = the autoscaler's ceiling for the Kafka source
+        replicas: 3
+        config:
+          min.insync.replicas: 2
+
+  - target: {kind: Deployment, name: schema-registry}
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: schema-registry
+      spec:
+        template:
+          spec:
+            containers:
+              - name: schema-registry
+                env:
+                  - name: KARAPACE_REPLICATION_FACTOR
+                    value: "3"
+
+  - target: {kind: FlinkDeployment, name: stream}
+    patch: |-
+      apiVersion: flink.apache.org/v1beta1
+      kind: FlinkDeployment
+      metadata:
+        name: stream
+      spec:
+        flinkConfiguration:
+          # Sized for 10,000 events/s (docs/streaming.md §4): one TaskManager
+          # decides ~4,100 events/s reading from Kafka (measured); at the
+          # autoscaler's 60% utilisation target that is 5 TaskManagers, so
+          # the job STARTS there instead of scaling up under load. The
+          # autoscaler may go to 24 -- the input topic's partition count,
+          # since the Kafka source never runs more subtasks than partitions.
+          job.autoscaler.vertex.max-parallelism: "24"
+        taskManager:
+          # one slot, one Python interpreter, ~one core busy per TaskManager
+          resource: {memory: 2048m, cpu: 1}
+        job:
+          parallelism: 5

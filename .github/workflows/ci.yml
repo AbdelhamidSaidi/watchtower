@@ -1,0 +1,141 @@
+# Continuous integration.
+#
+# Runs the same targets as `make ci`, so a green local run and a green CI run
+# mean the same thing.
+#
+# CONTINUOUS DEPLOYMENT is not here: the deployment target is a local k3d
+# cluster, which a GitHub-hosted runner cannot reach. CD is `make promote`,
+# run on the machine that hosts the cluster (it gates prod on CI + a staging
+# smoke test). To trigger it from GitHub, register that machine as a
+# self-hosted runner and add a job with `runs-on: self-hosted`.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + unit + integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/spark/Dockerfile
+          target: test
+          tags: watchtower/spark:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Lint
+        run: docker run --rm watchtower/spark:test python3 -m ruff check etl tools schemas tests producer
+
+      - name: Unit tests
+        run: docker run --rm watchtower/spark:test python3 -m pytest -q -m "not integration"
+
+      - name: Integration tests (full streaming replay)
+        run: docker run --rm watchtower/spark:test python3 -m pytest -q -m integration
+
+  flink:
+    name: streaming job (Flink mini-cluster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build Flink test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/flink/Dockerfile
+          target: test
+          tags: watchtower/flink:test
+          load: true
+          cache-from: type=gha,scope=flink
+          cache-to: type=gha,scope=flink,mode=max
+
+      - name: Job tests (real operators, keyed state, side output)
+        run: docker run --rm watchtower/flink:test python3 -m pytest -q -p no:cacheprovider tests/flink tests/unit/test_processor.py
+
+  schema:
+    name: schema compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The real Confluent compatibility engine, not a reimplementation:
+      # register the BASE branch's schema, then ask the registry whether this
+      # change's schema can follow it. An incompatible edit fails here, before
+      # any producer could ship it.
+      - name: Start Kafka + Schema Registry
+        run: |
+          ./deploy/k8s/scripts/secrets.sh
+          docker compose up -d --wait schema-registry
+
+      - name: Register the base schema
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if git cat-file -e "$BASE:schemas/security_event.avsc" 2>/dev/null; then
+            git show "$BASE:schemas/security_event.avsc" > /tmp/base.avsc
+            python3 tools/schema_registry.py register --url http://localhost:8081 --schema-file /tmp/base.avsc
+          else
+            echo "no schema on the base commit -- nothing to be compatible with"
+          fi
+
+      - name: Check this change is compatible
+        run: python3 tools/schema_registry.py check --url http://localhost:8081
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  manifests:
+    name: kubernetes manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render staging and prod overlays
+        run: make render
+
+  images:
+    name: runtime images build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Spark runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/spark/Dockerfile
+          target: runtime
+          tags: watchtower/spark:3.5.9
+          cache-from: type=gha
+      - name: Producer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/producer/Dockerfile
+          tags: watchtower/producer:1.0

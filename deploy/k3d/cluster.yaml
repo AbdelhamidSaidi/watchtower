@@ -1,0 +1,25 @@
+# Local Kubernetes: k3s in Docker via k3d.
+#
+# Chosen over kind or Docker Desktop's built-in Kubernetes for footprint: the
+# k3s control plane is ~400 MB, roughly half of a kubeadm-based one, and on a
+# ~4 GB Docker VM that difference is a Kafka broker.
+#
+# One server, no agents. Every pod lands on the same node, which is what lets
+# the ReadWriteOnce checkpoint volume be shared by the Spark driver and its
+# executors (see deploy/k8s/base/pipeline.yaml).
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: watchtower
+servers: 1
+agents: 0
+image: rancher/k3s:v1.36.4-k3s1
+options:
+  k3s:
+    extraArgs:
+      # Not used: services are reached with `kubectl port-forward`.
+      # Disabling them frees memory for Kafka.
+      - arg: --disable=traefik
+        nodeFilters: [server:*]
+      - arg: --disable=servicelb
+        nodeFilters: [server:*]

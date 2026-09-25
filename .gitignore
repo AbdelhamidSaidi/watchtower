@@ -1,0 +1,14 @@
+# Secrets: real values live only on the machine that runs the stack.
+# See secrets/README in docs/context.md for how they are provisioned.
+secrets/*
+!secrets/.gitkeep
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store

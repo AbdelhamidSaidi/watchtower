@@ -1,0 +1,34 @@
+<!-- Dev (docker compose) only: ClickHouse's defaults are sized for a server
+     (a 5 GB mark cache, 16 concurrent merges, ~3.5 GB server memory). In a
+     ~4 GB Docker VM shared with Kafka and Flink they pushed the VM into
+     swap, and swap (not the pipeline) was then the source of multi-second
+     latency spikes.
+
+     Merges are what use the memory here: security_events has 62 columns
+     and a merge holds buffers for each. So the lever is FEWER CONCURRENT
+     MERGES, not a low memory cap: a 768 MiB cap made ClickHouse reject
+     its own merges (MEMORY_LIMIT_EXCEEDED) while parts piled up.
+     The merge_tree thresholds below must stay within pool size x 2, or
+     the server refuses to start. -->
+<clickhouse>
+    <max_server_memory_usage>1717986918</max_server_memory_usage>  <!-- 1.6 GiB backstop: the limit is checked against RSS, which runs ~2x tracked memory -->
+    <mark_cache_size>67108864</mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <index_mark_cache_size>0</index_mark_cache_size>
+    <background_pool_size>4</background_pool_size>
+    <!-- ClickHouse's own diagnostic logs. metric_log has one column per
+         metric (over a thousand): merging it needed more memory than this
+         VM has, and the merge failed and retried forever. Prometheus
+         scrapes the same metrics from /metrics. query_log and part_log stay. -->
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <trace_log remove="1"/>
+    <text_log remove="1"/>
+    <query_views_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>4</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>4</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+</clickhouse>

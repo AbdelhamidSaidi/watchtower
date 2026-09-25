@@ -1,0 +1,261 @@
+# Kafka on Kubernetes, managed by the Strimzi operator (1.2.0, API v1).
+#
+# Controllers and brokers are SEPARATE node pools. Scaling a combined pool
+# would also change the KRaft controller quorum, which is a different and far
+# riskier operation. The controller pool is fixed; the BROKER pool scales on
+# its own, on demand:
+#
+#   1. The HorizontalPodAutoscaler below watches broker CPU and changes the
+#      pool's replicas through its `scale` subresource.
+#   2. A new broker joins empty -- partitions never move on their own.
+#      Cruise Control's auto-rebalance (spec.cruiseControl.autoRebalance)
+#      moves partitions ONTO the new broker right after it joins, and OFF a
+#      broker BEFORE Strimzi removes it. Without that second half, a
+#      scale-down would delete the only copy of whatever the broker held;
+#      Strimzi blocks such a scale-down rather than lose data.
+#
+# `make scale-kafka BROKERS=n` pins the count by setting the HPA's bounds.
+
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: controllers
+  labels:
+    strimzi.io/cluster: watchtower
+spec:
+  replicas: 1
+  roles:
+    - controller
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 1Gi
+        deleteClaim: false
+        kraftMetadata: shared
+  jvmOptions:
+    -Xms: 192m
+    -Xmx: 192m
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: brokers
+  labels:
+    strimzi.io/cluster: watchtower
+spec:
+  replicas: 1
+  roles:
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 5Gi
+        deleteClaim: false
+  jvmOptions:
+    -Xms: 320m
+    -Xmx: 320m
+  resources:
+    requests:
+      memory: 320Mi        # measured ~194 MiB at 100 events/sec
+      cpu: 200m
+    limits:
+      memory: 800Mi
+  template:
+    pod:
+      metadata:
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9404"
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: watchtower
+spec:
+  kafka:
+    version: 4.3.1
+    metadataVersion: 4.3-IV0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+    config:
+      # Replication settings are raised in the prod overlay. At 1 broker,
+      # anything above 1 makes internal topics impossible to create.
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      auto.create.topics.enable: false
+      # Cruise Control's metrics topic. RF follows the cluster's (prod: 3).
+      cruise.control.metrics.topic.replication.factor: 1
+      cruise.control.metrics.topic.min.insync.replicas: 1
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+  # Cruise Control: plans and executes partition moves when the broker pool
+  # changes size. It learns each partition's load from broker metrics
+  # sampled over time windows, and cannot propose a move until it has
+  # enough of them -- so the windows are short here (1 minute, 3 of them):
+  # a broker added a few minutes after startup can be filled right away.
+  cruiseControl:
+    autoRebalance:
+      - mode: add-brokers
+      - mode: remove-brokers
+    config:
+      metric.sampling.interval.ms: 60000
+      partition.metrics.window.ms: 60000
+      num.partition.metrics.windows: 3
+      broker.metrics.window.ms: 60000
+      num.broker.metrics.windows: 3
+    jvmOptions:
+      -Xms: 128m
+      -Xmx: 256m
+    resources:
+      requests:
+        memory: 320Mi
+        cpu: 50m
+      limits:
+        memory: 512Mi
+  entityOperator:
+    # Only the topic operator: it reconciles the KafkaTopic below. The user
+    # operator would be another JVM for users this deployment does not have.
+    topicOperator:
+      jvmOptions:
+        -Xms: 96m
+        -Xmx: 160m
+      resources:
+        requests:
+          memory: 192Mi
+          cpu: 50m
+        limits:
+          memory: 320Mi
+---
+# Brokers scale on CPU. At a fixed replication factor a broker's CPU grows
+# with the bytes it takes in and serves, so CPU is the load signal that
+# needs no extra metrics pipeline (metrics-server ships with k3s).
+#
+# Deliberately SLOW, both ways: every change triggers a partition
+# rebalance that copies data between brokers. Up needs 3 minutes of
+# sustained load; down needs 15 quiet minutes and removes one broker at a
+# time.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kafka-brokers
+spec:
+  scaleTargetRef:
+    apiVersion: kafka.strimzi.io/v1
+    kind: KafkaNodePool
+    name: brokers
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70      # of the 200m request
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 180
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+    scaleDown:
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 900
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: security-logs
+  labels:
+    strimzi.io/cluster: watchtower
+spec:
+  # More partitions than brokers on purpose: partitions are the unit of both
+  # Kafka and Spark parallelism, and they can be spread onto brokers added
+  # later. They cannot easily be reduced, only increased.
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: 86400000      # 1 day: this is a buffer, ClickHouse is the store
+    # Broker append time, not the source's clock: the Flink job's
+    # Kafka -> decision latency metric starts there.
+    message.timestamp.type: LogAppendTime
+    segment.bytes: 268435456
+---
+# What the Flink job writes: finished rows and dead letters, each consumed
+# by ClickHouse's Kafka engine (clickhouse/init/03_streaming_ingest.sql).
+# Short retention: ClickHouse is the store, these are hand-off buffers.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: security-events-scored
+  labels:
+    strimzi.io/cluster: watchtower
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: 21600000      # 6 hours
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: security-logs-rejected
+  labels:
+    strimzi.io/cluster: watchtower
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: 21600000
+---
+# JMX exporter rules: a focused subset of Strimzi's upstream example
+# (packaging/examples/metrics/kafka-metrics.yaml). Enough for broker count,
+# throughput and under-replicated partitions -- the signals for scaling.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics
+data:
+  kafka-metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+    - pattern: kafka.(\w+)<type=(.+), name=(.+)PerSec\w*, (.+)=(.+)><>Count
+      name: kafka_$1_$2_$3_total
+      type: COUNTER
+      labels:
+        "$4": "$5"
+    - pattern: kafka.(\w+)<type=(.+), name=(.+)PerSec\w*><>Count
+      name: kafka_$1_$2_$3_total
+      type: COUNTER
+    - pattern: kafka.(\w+)<type=(.+), name=(.+), (.+)=(.+)><>Value
+      name: kafka_$1_$2_$3
+      type: GAUGE
+      labels:
+        "$4": "$5"
+    - pattern: kafka.(\w+)<type=(.+), name=(.+)><>Value
+      name: kafka_$1_$2_$3
+      type: GAUGE

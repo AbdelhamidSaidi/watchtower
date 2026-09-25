@@ -1,0 +1,17 @@
+# apache-flink 2.2.1's own requirements (installed here so the package
+# itself can go in with --no-deps, skipping apache-flink-libraries).
+apache-beam>=2.54.0,<=2.61.0
+avro>=1.12.0
+cloudpickle>=2.2.0
+fastavro>=1.1.0,!=1.8.0
+httplib2>=0.19.0
+numpy>=1.22.4
+pandas>=1.3.0,<2.3
+pemja>=0.5.7,<0.5.8
+protobuf>=3.19.0
+py4j==0.10.9.7
+pyarrow>=5.0.0,<21.0.0
+python-dateutil>=2.8.0,<3
+pytz>=2018.3
+requests>=2.26.0
+ruamel.yaml>=0.18.4

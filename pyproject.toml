@@ -1,0 +1,20 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: replays a fixed event set through the full streaming chain (slower)",
+    "flink: runs the Flink job on a local mini-cluster (Flink image only)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pyflakes (unused imports, undefined names, shadowing) and hard syntax
+# errors: the checks that catch real bugs, without restyling the codebase.
+select = ["F", "E9"]

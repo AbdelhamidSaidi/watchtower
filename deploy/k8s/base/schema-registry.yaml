@@ -1,0 +1,143 @@
+# Schema Registry: Karapace (Aiven, Apache-2.0), Confluent-API-compatible.
+# Stores schemas in the `_schemas` Kafka topic, so it needs no volume of its
+# own -- it rebuilds its state from Kafka on start.
+#
+# Chosen over cp-schema-registry for footprint: 563 MB vs 2,180 MB image, a
+# smaller heap, and nothing in any client changes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: schema-registry
+  template:
+    metadata:
+      labels:
+        app: schema-registry
+    spec:
+      # Karapace must not start before Kafka answers. Its leader-election
+      # client fails its bootstrap if Kafka is absent at startup, and until
+      # it recovers, every write (schema registration) is refused with
+      # "Error while forwarding the request to the master". Compose orders
+      # this with depends_on; Kubernetes has no ordering, so wait here.
+      initContainers:
+        - name: wait-for-kafka
+          image: ghcr.io/aiven-open/karapace:6.2.3
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -c
+            - |
+              import socket, time
+              for attempt in range(120):
+                  try:
+                      socket.create_connection(("watchtower-kafka-bootstrap", 9092), timeout=3).close()
+                      print("kafka is up"); break
+                  except OSError as exc:
+                      print(f"waiting for kafka ({exc})", flush=True); time.sleep(5)
+              else:
+                  raise SystemExit("kafka never came up")
+      containers:
+        - name: schema-registry
+          image: ghcr.io/aiven-open/karapace:6.2.3
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-m", "karapace"]
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: KARAPACE_KARAPACE_REGISTRY
+              value: "true"
+            - name: KARAPACE_HOST
+              value: 0.0.0.0
+            - name: KARAPACE_PORT
+              value: "8081"
+            - name: KARAPACE_ADVERTISED_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KARAPACE_ADVERTISED_PROTOCOL
+              value: http
+            - name: KARAPACE_BOOTSTRAP_URI
+              value: watchtower-kafka-bootstrap:9092
+            - name: KARAPACE_CLIENT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KARAPACE_GROUP_ID
+              value: karapace
+            - name: KARAPACE_MASTER_ELIGIBILITY
+              value: "true"
+            - name: KARAPACE_MASTER_ELECTION_STRATEGY
+              value: highest
+            - name: KARAPACE_TOPIC_NAME
+              value: _schemas
+            # Must not exceed the broker count, or `_schemas` cannot be
+            # created and the registry never starts. Raised in prod.
+            - name: KARAPACE_REPLICATION_FACTOR
+              value: "1"
+            - name: KARAPACE_COMPATIBILITY
+              value: BACKWARD
+            - name: KARAPACE_LOG_LEVEL
+              value: WARNING
+          readinessProbe:
+            httpGet:
+              path: /subjects
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests:
+              memory: 64Mi      # measured ~35 MiB
+              cpu: 50m
+            limits:
+              memory: 320Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+spec:
+  selector:
+    app: schema-registry
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+# Registers schemas/security_event.avsc with BACKWARD compatibility.
+#
+# This Job is the ONLY path by which a schema reaches the registry: producers
+# look their schema up and refuse to start if it is absent. The CLI exits 2
+# while the registry is unreachable, so backoffLimit doubles as a wait loop.
+#
+# Jobs are immutable once created; the Makefile deletes the previous run
+# before applying, so a changed schema is registered on the next deploy.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: schema-init
+spec:
+  backoffLimit: 12
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: register
+          image: watchtower/spark:3.5.9
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - /opt/watchtower/tools/schema_registry.py
+            - register
+            - --url
+            - http://schema-registry:8081
+          resources:
+            requests:
+              memory: 64Mi
+            limits:
+              memory: 128Mi

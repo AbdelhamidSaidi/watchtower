@@ -1,0 +1,245 @@
+{
+  "type": "record",
+  "name": "SecurityEvent",
+  "namespace": "io.watchtower.events",
+  "doc": "One security event as emitted by a producer or agent. Registered under subject security-logs-value with BACKWARD compatibility: a new version may only add fields that carry a default. v2 adds request, network, process and file context -- enough to tell a bad request from a normal one, not just to count events.",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": "string",
+      "doc": "UUID, the dedup key"
+    },
+    {
+      "name": "timestamp",
+      "type": "string",
+      "doc": "ISO-8601 with offset. Kept as a string: clean.py casts it, so a malformed value is rejected with a reason rather than nulled at decode time"
+    },
+    {
+      "name": "source_ip",
+      "type": "string"
+    },
+    {
+      "name": "user",
+      "type": "string"
+    },
+    {
+      "name": "event_type",
+      "type": "string"
+    },
+    {
+      "name": "hostname",
+      "type": "string"
+    },
+    {
+      "name": "severity",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "LOGIN_FAILURE only"
+    },
+    {
+      "name": "command",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "COMMAND_EXECUTION only"
+    },
+    {
+      "name": "target_port",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "PORT_SCAN only"
+    },
+    {
+      "name": "log_source",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Emitting system: sshd, sudo, auditd, nginx, firewall, app"
+    },
+    {
+      "name": "outcome",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "success | failure | denied | allowed"
+    },
+    {
+      "name": "session_id",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Correlates events belonging to one session"
+    },
+    {
+      "name": "dest_ip",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Where the connection or request was going"
+    },
+    {
+      "name": "dest_port",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "Destination port"
+    },
+    {
+      "name": "protocol",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "ssh | http | https | tcp | udp"
+    },
+    {
+      "name": "auth_method",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "password | publickey | mfa | token"
+    },
+    {
+      "name": "http_method",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "GET, POST, ..."
+    },
+    {
+      "name": "url_path",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Path AND query string as received, undecoded"
+    },
+    {
+      "name": "http_status",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "Response status code"
+    },
+    {
+      "name": "user_agent",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Client User-Agent header"
+    },
+    {
+      "name": "bytes_sent",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null,
+      "doc": "Response size -- large sums from one source suggest exfiltration"
+    },
+    {
+      "name": "response_time_ms",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "Server-side latency"
+    },
+    {
+      "name": "process_name",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Executable that ran"
+    },
+    {
+      "name": "process_id",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "PID"
+    },
+    {
+      "name": "parent_process",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Parent executable -- sshd -> bash -> sudo is a shape worth seeing"
+    },
+    {
+      "name": "process_uid",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "Effective uid. 0 is root. Null means unknown -- never assume root"
+    },
+    {
+      "name": "file_path",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "File touched"
+    },
+    {
+      "name": "file_operation",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "read | write | delete | chmod"
+    },
+    {
+      "name": "scenario",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "Simulation ground truth. Never read by the pipeline; exists only so detection can be evaluated"
+    }
+  ]
+}
