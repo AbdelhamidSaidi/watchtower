@@ -203,13 +203,46 @@
       ]
     },
     {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Data quality between steps (events/min)",
+      "description": "Events flagged at each transformation boundary (etl/core/dq.py). normalize/enrich: doubtful but kept (defaulted severity, no user, unplaced IP, clock off). features/rules: contradictions -- should always be zero. validate: rejected, by reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "label_replace(sum by (__name__) (rate({__name__=~\"flink_taskmanager_job_task_operator_watchtower_dq_.+\"}[5m])) * 60, \"issue\", \"$1\", \"__name__\", \"flink_taskmanager_job_task_operator_watchtower_dq_(.+)\")",
+          "legendFormat": "{{issue}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ]
+    },
+    {
       "id": 6,
       "type": "row",
       "title": "Spark path (optional component)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 25,
         "w": 24,
         "h": 1
       },
@@ -222,7 +255,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 18,
+        "y": 26,
         "w": 24,
         "h": 1
       },
@@ -239,7 +272,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 19,
+        "y": 27,
         "w": 12,
         "h": 8
       },
@@ -281,7 +314,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 19,
+        "y": 27,
         "w": 12,
         "h": 8
       },
@@ -323,7 +356,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 27,
+        "y": 35,
         "w": 12,
         "h": 8
       },
@@ -356,7 +389,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 27,
+        "y": 35,
         "w": 12,
         "h": 8
       },
@@ -385,7 +418,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 35,
+        "y": 43,
         "w": 24,
         "h": 1
       },
@@ -402,7 +435,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 44,
         "w": 12,
         "h": 8
       },
@@ -435,7 +468,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 36,
+        "y": 44,
         "w": 12,
         "h": 8
       },
@@ -468,7 +501,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 52,
         "w": 12,
         "h": 8
       },
@@ -497,7 +530,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 52,
+        "y": 60,
         "w": 24,
         "h": 1
       },
@@ -514,7 +547,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 53,
+        "y": 61,
         "w": 6,
         "h": 8
       },
@@ -547,7 +580,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 53,
+        "y": 61,
         "w": 6,
         "h": 8
       },
@@ -580,7 +613,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 53,
+        "y": 61,
         "w": 12,
         "h": 8
       },
@@ -613,7 +646,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 61,
+        "y": 69,
         "w": 12,
         "h": 8
       },
@@ -646,7 +679,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 61,
+        "y": 69,
         "w": 12,
         "h": 8
       },

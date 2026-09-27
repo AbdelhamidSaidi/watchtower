@@ -14,7 +14,7 @@ latency, [`streaming.md`](streaming.md). For tuning detection, see
 
 | | runs on | Kafka | stream processing (Flink) | purpose |
 |---|---|---|---|---|
-| **dev** | docker compose | 1 combined node | 1 JobManager + 1 TaskManager (2 slots) | seconds-long edit/run loop |
+| **dev** | docker compose | 1 combined node | 1 JobManager + 1 TaskManager (1 slot) | seconds-long edit/run loop |
 | **staging** | k3d (Kubernetes) | 1 controller + 1–2 brokers (autoscaled) | 1–3 TaskManagers (autoscaled) | production-shaped traffic, the promotion gate |
 | **prod** | k3d (Kubernetes) | 3 controllers + 3–6 brokers (autoscaled), RF 3 | 5–24 TaskManagers (autoscaled; 5 = 10,000 events/s) | the real shape |
 
@@ -75,6 +75,7 @@ docker compose restart pipeline
 ```bash
 make test-unit      # 136 tests, ~25s
 make test           # + 11 streaming-replay tests, ~4 min
+make test-airflow   # DAGs parse and are wired as documented; ops; evaluator
 make ci             # lint + tests + render both overlays
 make evaluate       # detection vs ground truth, per attack type (dev)
 ```
@@ -93,6 +94,10 @@ gap between the test run and the pipeline.
 | `test_config` | secrets resolve from files first and are never printed |
 | `test_metrics` | progress events → gauges; free-text reasons → bounded labels |
 | `integration/` | a fixed event set through the whole streaming chain. The burst spans two micro-batches and duplicates arrive a batch late, so **cross-batch state** is what is being tested |
+
+The Flink job's tests run in the Flink image and the DAGs' in the Airflow
+image, for the same reason. `tests/orchestration/test_ops.py` is plain
+Python and runs in the Spark image too.
 
 CI (`.github/workflows/ci.yml`) runs the same targets, plus a schema
 compatibility gate (§5).
@@ -265,6 +270,9 @@ whose table predates the columns the view reads.
 | `clickhouse_password` | ClickHouse server, pipeline | generated |
 | `grafana_admin_password` | Grafana | generated |
 | `groq_api_key` | detection | **you** — empty disables detection |
+| `airflow_db_password` | Airflow's Postgres, Airflow | generated |
+| `airflow_admin_password` | Airflow UI (`admin`) | generated |
+| `airflow_jwt_secret` | tokens between Airflow's components | generated, 64 bytes |
 
 Files live in `secrets/` (git-ignored, mode 600). They reach containers as
 **mounted files**, never as values in a manifest or compose file: an env var
@@ -273,6 +281,35 @@ leaks through `docker inspect`, `kubectl describe` and crash dumps.
 `make secrets` never overwrites. To **rotate**, delete the file and re-run,
 then redeploy. ClickHouse keeps its password in its data volume, so
 rotating that one also needs the ClickHouse user updated in place.
+
+---
+
+## 7b. Orchestration (Airflow)
+
+The pipeline end to end every 10 minutes (`watchtower_pipeline`: services,
+stream job, extract → transform → load; restarts a stopped stream job in
+Kubernetes), plus hourly data-quality checks, the daily rollup and
+detection quality. Full description: [`orchestration.md`](orchestration.md).
+
+```bash
+make airflow-up                    # dev: stack + Airflow, producer at 100/s
+                                   # UI http://localhost:8080, admin / secrets/airflow_admin_password
+make airflow-ui ENV=staging        # Kubernetes: port-forward the UI
+docker exec watchtower-airflow airflow dags unpause watchtower_pipeline
+make pipeline-health               # dev: the latest end-to-end verdict, stage by stage
+docker exec watchtower-airflow airflow backfill create --dag-id watchtower_daily \
+  --from-date 2026-09-01 --to-date 2026-09-26          # rebuild past days
+```
+
+DAGs start paused in dev and unpaused in Kubernetes. A **failed** run is
+data, not noise: the reason is in the task log and in
+`watchtower.data_quality_checks` / `watchtower.detection_quality`. A failed
+daily `reconcile` means events for that day arrived after the rollup —
+clear the run and it rebuilds the day.
+
+On an existing dev ClickHouse volume, `make airflow-up` applies
+`clickhouse/init/04_orchestration.sql` itself; in Kubernetes,
+`make ch-migrate-k8s ENV=...`.
 
 ---
 
@@ -285,6 +322,8 @@ Open Prometheus (`make prometheus` → `/alerts`) or Grafana (`make grafana`).
 | `StreamJobDown` | Flink JobManager unreachable | `kubectl get flinkdeployment stream`; operator logs |
 | `StreamFallingBehind` | > 10,000 events waiting in Kafka for 5 min | the autoscaler should be adding TaskManagers -- if not, it is at its ceiling or pods are Pending |
 | `StreamLatencyHigh` | Kafka → decision p95 > 2 s for 5 min | Flink UI: busy / backpressured time per operator |
+| `StreamDataQualityDegraded` | > 1% of events doubtful after normalize/enrich for 10 min (blank users, unknown severities, unplaced IPs, clock skew) | the Grafana panel *Data quality between steps* says which issue; usually one log source changed format |
+| `StreamLogicInconsistent` | **critical** — features or a decision contradicting themselves | a detection bug or corrupted state: compare with the last green test run; restore from a savepoint (§9) |
 | `StreamRejectingEvents` | the job rejected messages in the last 10 min | `SELECT reject_reason, count() FROM rejected_events GROUP BY 1` |
 | `PipelineDown` | (Spark component) driver unreachable | `kubectl logs deploy/pipeline` |
 | `StreamingQueryStopped` | a query died; driver restarting | logs; it resumes from checkpoint |

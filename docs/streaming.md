@@ -96,6 +96,30 @@ Kafka security-logs
   2.2 has an async operator, which is the way to bring the LLM back without
   blocking — see §7.)
 
+### Data quality between the steps
+
+Every event is checked at each boundary it crosses (`etl/core/dq.py`),
+without being changed or dropped:
+
+| after | counted as `dq_<step>_<issue>` | meaning |
+|---|---|---|
+| validate | the reject reason | refused (dead-letter), by reason |
+| normalize | `severity_defaulted`, `missing_user`, `missing_hostname` | kept, but a field was blank or unknown |
+| enrich | `unknown_country`, `future_timestamp`, `stale_timestamp` | an external IP GeoIP cannot place; event time > 5 min ahead or > 1 day behind the job's clock |
+| features | `window_inconsistent` | a 1-minute count above its 5-minute one: a bug or corrupted state |
+| rules | `score_out_of_range`, `action_mismatch` | the decision contradicts its score: a bug |
+
+The checks are comparisons on fields already in hand, counted with the
+job's batched counters (pushed once a second). Estimated at 1–2 µs per
+event against ~173 µs, not measured separately. Clean synthetic traffic
+keeps every counter at 0.
+
+Watched three ways: the Grafana panel *Data quality between steps*; the
+alerts `StreamDataQualityDegraded` (> 1% of events doubtful for 10 min)
+and `StreamLogicInconsistent` (any contradiction, critical); and the
+Airflow pipeline DAG's `transform` stage (`doubtful_share` warns,
+`logic_inconsistent` fails).
+
 ## 3. Latency
 
 ### Capacity (one TaskManager, one slot, one interpreter)

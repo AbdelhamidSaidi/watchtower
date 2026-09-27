@@ -28,6 +28,38 @@ groups:
             be adding TaskManagers; if this persists it has hit its ceiling
             (job.autoscaler.vertex.max-parallelism) or the cluster is full.
 
+      # Data quality between the transformation steps (etl/core/dq.py):
+      # events that got through validation but are doubtful -- defaulted
+      # severity, no user on a login, an address GeoIP cannot place, a
+      # clock far off. A little is normal; a source sending them in bulk
+      # quietly weakens detection.
+      - alert: StreamDataQualityDegraded
+        expr: >-
+          sum(increase({__name__=~"flink_taskmanager_job_task_operator_watchtower_dq_(normalize|enrich)_.+"}[10m]))
+          / clamp_min(sum(increase(flink_taskmanager_job_task_operator_watchtower_scored_events[10m])), 1)
+          > 0.01
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of events doubtful after normalize/enrich"
+          description: >-
+            Which issue: the dq_normalize_* / dq_enrich_* series on the
+            Grafana dashboard. Usually one log source changed its format.
+
+      # Features and rules contradicting themselves (a 1-minute count above
+      # its 5-minute one, an action that does not match the score) is a bug
+      # or corrupted state, never traffic. One is enough.
+      - alert: StreamLogicInconsistent
+        expr: >-
+          sum(increase({__name__=~"flink_taskmanager_job_task_operator_watchtower_dq_(features|rules)_.+"}[10m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value }} events with inconsistent features or decisions"
+          description: >-
+            A detection bug or corrupted keyed state. Compare the job's
+            version with the last green test run; restore from a savepoint
+            if the state is suspect (operations.md, Recovery).
+
       - alert: StreamRejectingEvents
         expr: sum(increase(flink_taskmanager_job_task_operator_watchtower_rejected_events[10m])) > 0
         labels: {severity: warning}

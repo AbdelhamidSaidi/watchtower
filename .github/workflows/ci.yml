@@ -73,6 +73,31 @@ jobs:
       - name: Job tests (real operators, keyed state, side output)
         run: docker run --rm watchtower/flink:test python3 -m pytest -q -p no:cacheprovider tests/flink tests/unit/test_processor.py
 
+  airflow:
+    name: orchestration (Airflow DAGs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build Airflow test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/airflow/Dockerfile
+          target: test
+          tags: watchtower/airflow:test
+          load: true
+          cache-from: type=gha,scope=airflow
+          cache-to: type=gha,scope=airflow,mode=max
+
+      # An import error in a DAG file removes the DAG from Airflow without a
+      # failure anywhere else -- this is where it fails instead.
+      - name: DAGs parse and are wired as documented; their ops; the evaluator
+        run: docker run --rm watchtower/airflow:test
+
   schema:
     name: schema compatibility
     runs-on: ubuntu-latest

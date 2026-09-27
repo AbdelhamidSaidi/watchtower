@@ -1,0 +1,11 @@
+# On top of apache-airflow (the base image), installed against Airflow's
+# constraints file for the same version (docker/airflow/Dockerfile).
+
+# Airflow's own metadata database: sync (scheduler) and async (API server).
+apache-airflow-providers-postgres==7.0.2
+asyncpg==0.31.0
+
+# tools/evaluate_detection.py reads the producer's ground truth back out of
+# Kafka. Same versions as the producer (producer/requirements.txt).
+kafka-python==3.0.11
+fastavro==1.12.2

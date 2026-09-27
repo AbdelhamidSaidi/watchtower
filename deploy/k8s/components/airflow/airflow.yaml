@@ -1,0 +1,340 @@
+# Airflow: the batch side around the stream (orchestration/dags).
+#
+#   airflow-db             Postgres, Airflow's metadata (runs, task states)
+#   airflow-scheduler      schedules runs and executes their tasks
+#                          (LocalExecutor: tasks run inside this pod), as
+#                          the `airflow` service account -- allowed to
+#                          restart the stream job through its FlinkDeployment
+#   airflow-dag-processor  parses the DAG files
+#   airflow-api-server     UI + REST API + the execution API tasks report to
+#
+# One image for all (docker/airflow/Dockerfile); start.sh runs the
+# component named in `args`. docker compose runs the same three in one
+# container. Secrets are mounted files, read by Airflow's *_CMD options.
+#
+# UI: make airflow-ui ENV=staging  -> http://localhost:8080
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-env
+data:
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD: >-
+    sh -c 'printf "postgresql+psycopg2://airflow:%s@airflow-db/airflow" "$(cat /run/secrets/airflow_db_password)"'
+  AIRFLOW__API_AUTH__JWT_SECRET_CMD: cat /run/secrets/airflow_jwt_secret
+  # Tasks run in the scheduler pod and report their state here.
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+  # Deployed means running: no one has to unpause each DAG by hand.
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+  # The UI fetches a task's log from the pod that ran it, by this name. Pod
+  # hostnames do not resolve in the cluster; pod IPs do.
+  AIRFLOW__CORE__HOSTNAME_CALLABLE: airflow.utils.net.get_host_ip_address
+  CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+  # watchtower_pipeline: the stream job's REST API (the Flink operator's
+  # service for FlinkDeployment `stream`), and restart a job that has
+  # stopped for good by bumping that FlinkDeployment's restartNonce.
+  FLINK_REST_URL: http://stream-rest:8081
+  WATCHTOWER_FLINK_RESTART: operator
+  WATCHTOWER_FLINK_DEPLOYMENT: stream
+  # The producer in base/ is synthetic; set "false" once real logs flow and
+  # the detection-quality DAG disappears.
+  WATCHTOWER_SYNTHETIC_TRAFFIC: "true"
+---
+# What watchtower_pipeline may do to the stream: read the FlinkDeployment
+# and patch it (restartNonce). Nothing else, and only that one.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-restart-stream
+rules:
+  - apiGroups: [flink.apache.org]
+    resources: [flinkdeployments]
+    resourceNames: [stream]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-restart-stream
+subjects:
+  - kind: ServiceAccount
+    name: airflow
+roleRef:
+  kind: Role
+  name: airflow-restart-stream
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-db
+spec:
+  selector:
+    app: airflow-db
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: airflow-db
+spec:
+  serviceName: airflow-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-db
+  template:
+    metadata:
+      labels:
+        app: airflow-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: airflow
+            - name: POSTGRES_DB
+              value: airflow
+            - name: POSTGRES_PASSWORD_FILE
+              value: /run/secrets/airflow_db_password
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "airflow", "-d", "airflow"]
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 50m
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+      volumes:
+        - name: secrets
+          secret:
+            secretName: watchtower-secrets
+            items:
+              - key: airflow_db_password
+                path: airflow_db_password
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# The scheduler migrates the database before it starts; the other two
+# wait for that migration instead of racing it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-scheduler
+  template:
+    metadata:
+      labels:
+        app: airflow-scheduler
+    spec:
+      serviceAccountName: airflow
+      initContainers:
+        - name: migrate
+          image: watchtower/airflow:3.3.2
+          imagePullPolicy: IfNotPresent
+          args: ["db", "migrate"]
+          envFrom: &env
+            - configMapRef:
+                name: pipeline-env
+            - configMapRef:
+                name: airflow-env
+          volumeMounts: &mounts
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+      containers:
+        - name: scheduler
+          image: watchtower/airflow:3.3.2
+          imagePullPolicy: IfNotPresent
+          args: ["scheduler"]
+          envFrom: *env
+          ports:
+            - name: logs
+              containerPort: 8793
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8974
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          # Tasks run in this pod. The largest, detection quality, holds 15
+          # minutes of ground truth: ~300 MB at 1,000 events/s.
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 250m
+            limits:
+              memory: 1Gi
+          volumeMounts: *mounts
+      volumes:
+        - name: secrets
+          secret:
+            secretName: watchtower-secrets
+            items:
+              - key: clickhouse_password
+                path: clickhouse_password
+              - key: airflow_db_password
+                path: airflow_db_password
+              - key: airflow_jwt_secret
+                path: airflow_jwt_secret
+              - key: airflow_admin_password
+                path: airflow_admin_password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-dag-processor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-dag-processor
+  template:
+    metadata:
+      labels:
+        app: airflow-dag-processor
+    spec:
+      initContainers:
+        - name: wait-for-migration
+          image: watchtower/airflow:3.3.2
+          imagePullPolicy: IfNotPresent
+          args: ["db", "check-migrations", "--migration-wait-timeout", "600"]
+          envFrom: &env
+            - configMapRef:
+                name: pipeline-env
+            - configMapRef:
+                name: airflow-env
+          volumeMounts: &mounts
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+      containers:
+        - name: dag-processor
+          image: watchtower/airflow:3.3.2
+          imagePullPolicy: IfNotPresent
+          args: ["dag-processor"]
+          envFrom: *env
+          resources:
+            requests:
+              memory: 192Mi
+              cpu: 100m
+            limits:
+              memory: 384Mi
+          volumeMounts: *mounts
+      volumes:
+        - name: secrets
+          secret:
+            secretName: watchtower-secrets
+            items:
+              - key: clickhouse_password
+                path: clickhouse_password
+              - key: airflow_db_password
+                path: airflow_db_password
+              - key: airflow_jwt_secret
+                path: airflow_jwt_secret
+              - key: airflow_admin_password
+                path: airflow_admin_password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-api-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-api-server
+  template:
+    metadata:
+      labels:
+        app: airflow-api-server
+    spec:
+      initContainers:
+        - name: wait-for-migration
+          image: watchtower/airflow:3.3.2
+          imagePullPolicy: IfNotPresent
+          args: ["db", "check-migrations", "--migration-wait-timeout", "600"]
+          envFrom: &env
+            - configMapRef:
+                name: pipeline-env
+            - configMapRef:
+                name: airflow-env
+          volumeMounts: &mounts
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
+      containers:
+        - name: api-server
+          image: watchtower/airflow:3.3.2
+          imagePullPolicy: IfNotPresent
+          args: ["api-server"]
+          envFrom: *env
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /api/v2/monitor/health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+          volumeMounts: *mounts
+      volumes:
+        - name: secrets
+          secret:
+            secretName: watchtower-secrets
+            items:
+              - key: clickhouse_password
+                path: clickhouse_password
+              - key: airflow_db_password
+                path: airflow_db_password
+              - key: airflow_jwt_secret
+                path: airflow_jwt_secret
+              - key: airflow_admin_password
+                path: airflow_admin_password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-api-server
+spec:
+  selector:
+    app: airflow-api-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

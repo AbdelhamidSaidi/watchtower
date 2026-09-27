@@ -118,6 +118,10 @@ RUN python3 -m pip install --no-cache-dir --timeout 120 --retries 10 -r /tmp/req
 COPY --chown=185:185 tests /opt/watchtower/tests
 # Linted with everything else; the producer's deps are not needed to lint it.
 COPY --chown=185:185 producer /opt/watchtower/producer
+# The DAGs' ops are plain Python and tested here too; the DAG files
+# themselves need Airflow, so tests/orchestration/test_dags.py skips here
+# and runs in the Airflow image (`make test-airflow`).
+COPY --chown=185:185 orchestration /opt/watchtower/orchestration
 COPY --chown=185:185 pyproject.toml /opt/watchtower/pyproject.toml
 
 # pyspark lives under /opt/spark/python, not site-packages.

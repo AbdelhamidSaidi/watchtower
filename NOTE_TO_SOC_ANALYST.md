@@ -29,6 +29,8 @@ If you read an earlier copy, these are the differences that affect you:
 | **new reject reasons** | — | `invalid_event_id`, `sink_parse_error` (§6) |
 | **drill-down queries** | a lookup by IP or event_id scanned the whole table | **20–600x less data read** (§6) |
 | **alerts** | `DetectionOutage`, `DetectionDisabled`, `RejectedEventsPresent` | live path: `StreamJobDown`, `StreamFallingBehind`, `StreamLatencyHigh`, `StreamRejectingEvents` (§4) |
+| **morning review** | query `security_events` | **`daily_top_sources`, `daily_rule_hits`, `daily_summary`**, built by Airflow each night (§4) |
+| **detection measured** | once, on the Spark path | **on the live path**, every 6 hours, kept in `detection_quality` (§1) |
 
 The rules, their scores and the thresholds are **unchanged**, and the live
 path computes exactly what the Spark path computes — a test feeds the same
@@ -131,13 +133,32 @@ On ~33,000 labelled events (Spark path, same rules):
 | lateral movement | **94.3%** | behaviour |
 | **normal traffic** | **0.32% blocked, 0% alerted** | see below |
 
-On the live path, a 10-minute run at 1,000 events/s: 576,843 allowed,
-16,654 blocked, every attack family firing its rule (brute force 8,535
-hits, password spray 8,155, repeated signatures 6,316, web scan 4,483,
-login after brute force 3,329, scanner agent 3,019, port scan 2,314, …).
-**The per-scenario percentages above have not yet been re-measured against
-the live path's output** (`make evaluate`); the logic is the same, and a
-test holds it equal.
+**On the live path** (`make evaluate`, 15 minutes at 1,000 events/s,
+879,721 events, 2026-09-27):
+
+| scenario | attacks | blocked | first flag after (new source) |
+|---|---|---|---|
+| sql injection / path traversal / web scan / port scan / privilege escalation | 18 | **100%** | the first event |
+| ssh brute force | 3 | **99.4%** | 19 events, 1.2 s |
+| password spray | 3 | **99.0%** | 19 events, 1.6 s |
+| data exfiltration | 1 | **96.5%** | 3 events, 0.9 s |
+| lateral movement | 4 | **95.8%** | 7–16 events, 0.4–1.5 s |
+| **normal traffic** | — | **0.034% blocked, 0% alerted** | see below |
+
+All 29 attacks were caught; every event had a decision. An attack from a
+source that attacked in the previous 5 minutes is blocked on its first
+event: the source's window already holds the evidence.
+
+Airflow repeats this every 6 hours on live traffic and keeps each report
+in `watchtower.detection_quality`; a run fails if an attack is missed,
+the median first flag exceeds 5 s, or normal traffic on uninvolved hosts
+is blocked above 0.01%:
+
+```sql
+SELECT evaluated_at, attacks_caught, attacks_seen, median_time_to_flag_s,
+       normal_blocked_uninvolved, passed, failures
+FROM watchtower.detection_quality ORDER BY evaluated_at DESC LIMIT 20;
+```
 
 **Two things to understand about those numbers.**
 
@@ -145,14 +166,25 @@ test holds it equal.
 invisible until the failures pile up -- that is the 2-6% gap. Signature
 rules have no such gap: the first SQL injection is blocked.
 
-*The 0.32% are not innocent hosts.* All 90 came from exactly two
-workstations -- the ones running the exfiltration and lateral-movement
-attacks -- and were those hosts' own background traffic during the attack.
+*Almost none of the blocked normal traffic is from innocent hosts.* On the
+live path, 290 of the 297 came from the four workstations running
+lateral-movement or exfiltration attacks -- their own background traffic,
+during the attack or in the 5 minutes after, while their windows still
+held the evidence. (On the Spark path, all 90 of the 0.32% were the same
+kind.)
 Behavioural rules key on the SOURCE, so a host that is exfiltrating gets
 **all** its traffic blocked for the window. That is containment, and
 usually what you want. **It is a policy choice, and yours to confirm**:
 if you would rather block only the offending requests, the behavioural
 rules must be scoped to event type.
+
+*The other 7 are real false positives,* all from remote-staff VPN hosts
+(102.67.x.x): busy hosts whose ordinary traffic includes failed logins
+(8% of it in the simulation) pass 20 failures in 5 minutes without any
+attack, and their next successful login trips `login_after_brute_force`
+-- 7 of 868,112 normal events. Twenty failures in 5 minutes is rare for a
+workstation and routine for a host this busy: worth a higher threshold, or
+a per-user count, for remote hosts.
 
 ---
 
@@ -276,6 +308,14 @@ WHERE ingested_at > now() - INTERVAL 1 MINUTE;
 ```
 
 Zero means nothing is arriving at all -- look at the job, not the threats.
+Airflow checks the whole path every 10 minutes and keeps the verdict,
+stage by stage -- the quickest answer to "is it quiet, or is it broken?":
+
+```sql
+SELECT stage, check_name, passed, detail FROM watchtower.pipeline_health
+WHERE run_id = (SELECT argMax(run_id, checked_at) FROM watchtower.pipeline_health)
+ORDER BY stage;
+```
 
 **End-to-end latency**, any time (`make latency` in dev):
 
@@ -289,6 +329,26 @@ FROM (SELECT toUnixTimestamp64Milli(ingested_at) - toUnixTimestamp64Milli(timest
 The Grafana dashboard's first row (*Streaming path*) shows the same live:
 decision latency, Kafka backlog, decisions per second by action, and the
 number of TaskManagers the autoscaler is running.
+
+**The morning list.** Each night Airflow closes the previous UTC day and
+builds small tables from it, so a review does not scan a day of events:
+
+```sql
+-- the day's most-blocked sources, with every rule they fired
+SELECT source_ip, events, blocked, alerted, rules, first_seen, last_seen
+FROM watchtower.daily_top_sources WHERE day = yesterday() ORDER BY blocked DESC;
+
+-- which rules fired, and on how many sources
+SELECT rule, recommended_action, events, sources
+FROM watchtower.daily_rule_hits WHERE day = yesterday() ORDER BY events DESC;
+```
+
+`daily_summary` (events per type and decision) always adds up to the
+day's stored events exactly -- the rollup refuses to finish otherwise. An
+hourly check also records the data's health in
+`watchtower.data_quality_checks`: volume, rejected share, missing fields,
+latency, unmerged copies, and whether the share of blocks jumped against
+the past week. Details: `docs/orchestration.md`.
 
 ### If you run the replay path with the LLM
 

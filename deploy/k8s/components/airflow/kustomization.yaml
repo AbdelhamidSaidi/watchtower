@@ -1,0 +1,9 @@
+# Airflow, the batch side around the stream (orchestration/dags): hourly
+# data-quality checks, the daily rollup, detection-quality evaluation.
+# In both overlays. It reads the same pipeline-env as the stream, and its
+# secrets come from watchtower-secrets (deploy/k8s/scripts/secrets.sh).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - airflow.yaml

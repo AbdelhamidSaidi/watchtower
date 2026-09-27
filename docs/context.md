@@ -11,10 +11,11 @@ what has been measured, and what is still missing. Companion documents:
 |---|---|
 | [`streaming.md`](streaming.md) | the live Flink path in depth: latency, per-event cost, scaling |
 | [`operations.md`](operations.md) | runbook: run, deploy, scale, migrate, recover, alerts |
+| [`orchestration.md`](orchestration.md) | Airflow: data-quality checks, daily rollups, detection quality |
 | [`capacity-report.md`](capacity-report.md) | load-test results on the development machine |
 | [`../NOTE_TO_SOC_ANALYST.md`](../NOTE_TO_SOC_ANALYST.md) | using and tuning the detector |
 
-*Last updated 2026-09-25.*
+*Last updated 2026-09-27.*
 
 ---
 
@@ -40,6 +41,7 @@ at a time in Apache Flink**, and stored in ClickHouse for analysis.
        +-- dedup              drop re-delivered event_ids        (STATE)
        +-- features           rolling 1- and 5-minute windows    (STATE)
        +-- rules              score -> allow / alert / block
+       |   (between every step: data-quality counters, core/dq.py)
        |
        v
   Kafka  security-events-scored        security-logs-rejected
@@ -56,6 +58,14 @@ events/s, 24 minutes of steady state: **median 194 ms, p95 346 ms**; the
 decision itself ~5 ms after the event reaches Kafka. With 50 ms ClickHouse
 blocks the median reached 66–84 ms while the machine was not short of
 memory. Details and caveats: [`streaming.md`](streaming.md) §3.
+
+**Airflow orchestrates the whole pipeline** without putting events into
+batches: every 10 minutes it walks the path an event takes — Kafka, the
+Flink job, ClickHouse — checks each stage, restarts the stream job if it
+has stopped for good, and records the verdict. Around that, hourly
+data-quality checks, a daily rollup (deduplicate, summarize, reconcile)
+and a 6-hourly detection-quality evaluation —
+[`orchestration.md`](orchestration.md).
 
 **The Spark pipeline** (`etl/pipeline.py`, `etl/transform/`) is the
 original micro-batch implementation. It is no longer the live path; it
@@ -132,6 +142,16 @@ inserting. A replay after a failure can repeat rows; `security_events` is a
 `ReplacingMergeTree`, so repeats collapse on merge (use `FINAL` when a
 query must be exact).
 
+### Airflow for the batch side, not the stream
+
+The stream is never scheduled: Flink runs it continuously and the Flink
+operator keeps it alive. Airflow supervises it — one DAG checks every
+stage end to end and restarts a stopped job — and runs what IS scheduled:
+checking a closed hour, rolling up a closed day, measuring detection. That
+work is tied to a data interval, needs retries and a history, and must be
+re-runnable for any past day. The DAGs only wire plain-Python functions
+(`orchestration/ops/`) that are tested without Airflow.
+
 ### PyFlink in thread mode, one slot per TaskManager
 
 Detection is Python. PyFlink's *thread* mode embeds the interpreter in the
@@ -177,7 +197,8 @@ simulator's.
 Watchtower/
 ├── Makefile                      every workflow -- `make help`
 ├── docker-compose.yml            DEV: Kafka, Karapace, ClickHouse, Flink (JM + TMs),
-│                                 simulator (profile sim), Spark (profile spark)
+│                                 simulator (profile sim), Spark (profile spark),
+│                                 Airflow + Postgres (profile airflow)
 ├── schemas/
 │   ├── security_event.avsc       the wire contract (Avro, v2)
 │   └── registry.py               wire format + registry client
@@ -195,29 +216,36 @@ Watchtower/
 │   ├── scaling/executors.py      Spark executor autoscaler (Spark path only)
 │   ├── observability/metrics.py  Spark driver metrics
 │   └── config.py                 settings; secrets read from files
+├── orchestration/
+│   ├── dags/                     Airflow: the pipeline end to end, data quality,
+│   │                             daily rollup, detection quality
+│   └── ops/                      what the DAGs do, plain Python
 ├── clickhouse/
 │   ├── init/01_schema.sql        tables (query-optimised layout, skip indexes)
 │   ├── init/02_*.sql  03_*.sql   v2 columns; Kafka-engine ingest + views
+│   ├── init/04_orchestration.sql the tables Airflow writes
 │   └── config/                   streaming.xml (broker macro), dev-limits.xml
 ├── tools/
 │   ├── schema_registry.py        the only path a schema reaches the registry
-│   ├── evaluate_detection.py     detection vs ground truth (`make evaluate`)
+│   ├── evaluate_detection.py     detection vs ground truth (`make evaluate`, and Airflow)
 │   ├── bench_queries.py          SQL workload benchmark (`make ch-bench`)
 │   ├── relayout_security_events.py   move data to the new table layout
 │   └── load_test.py  swap_bounded_test.py  drain_test.sh   capacity tests
-├── tests/                        unit, parity, Spark streaming replay, Flink job
-├── docker/{flink,spark,producer}/Dockerfile
+├── tests/                        unit, parity, Spark streaming replay, Flink job,
+│                                 orchestration (ops, evaluator, DAG structure)
+├── docker/{flink,spark,producer,airflow}/Dockerfile
 ├── deploy/
 │   ├── k3d/cluster.yaml
 │   ├── k8s/base/                 Strimzi Kafka (+ Cruise Control, broker HPA),
 │   │                             registry, ClickHouse, FlinkDeployment
 │   │                             (autoscaled), producer, Prometheus, Grafana
 │   ├── k8s/components/spark-pipeline/   the Spark job, opt-in
+│   ├── k8s/components/airflow/   Airflow (scheduler, DAG processor, API server, Postgres)
 │   ├── k8s/overlays/{staging,prod}/
 │   ├── k8s/scripts/              Strimzi + Flink operator install, secrets,
 │   │                             smoke test, watch-scaling, replica keeper
 │   └── observability/            alert rules, scrape config, dashboard
-├── .github/workflows/ci.yml      lint, Spark tests, Flink tests, schema gate
+├── .github/workflows/ci.yml      lint, Spark tests, Flink tests, Airflow tests, schema gate
 ├── secrets/                      git-ignored; `make secrets`
 └── docs/
 ```
@@ -306,6 +334,10 @@ exists only for `make evaluate`.
 | `suspicious_events` | `MergeTree` | `is_suspicious = 1`, via materialized view |
 | `rejected_events` | `MergeTree` | refused messages: reason, schema id, original bytes (base64), Kafka coordinates |
 | `security_events_queue`, `rejected_events_queue` | `Kafka` | the streaming path's intake, feeding the tables above through views |
+| `pipeline_health` | `MergeTree` | the pipeline's end-to-end verdict every 10 minutes, per stage (Airflow) |
+| `data_quality_checks` | `MergeTree` | every hourly check result (Airflow) |
+| `daily_summary`, `daily_rule_hits`, `daily_top_sources` | `MergeTree`, a partition per day | the daily rollup, rebuilt idempotently (Airflow) |
+| `detection_quality` | `MergeTree` | every detection evaluation, with its full report (Airflow) |
 
 `security_events` is sorted by
 `(toStartOfTenMinutes(timestamp), source_ip, timestamp, event_id)` with a
@@ -335,6 +367,8 @@ the table 31% smaller. `make ch-bench` re-runs the workload.
 | Spark | 3.5.9, Scala 2.12, Java 17 | the replay path |
 | k3s (via k3d 5.9.0) | 1.36.4 | lightest local control plane |
 | Prometheus / Grafana | 3.14.0 / 13.2.2 | |
+| Airflow | 3.3.2 (slim image, Python 3.12) | orchestration; installed against its own constraints file |
+| Postgres | 18.6 | Airflow's metadata only |
 
 ### Images
 
@@ -345,6 +379,8 @@ the table 31% smaller. `make ch-bench` re-runs the workload.
 - **`docker/spark`** — `base` / `test` / `runtime`; the Spark path and the
   main test suite.
 - **`docker/producer`** — the simulator.
+- **`docker/airflow`** — Airflow slim + the postgres provider, the Kafka
+  client for the evaluator, and the DAGs; `test` stage adds pytest.
 
 ### Kafka addresses and topics
 
@@ -362,7 +398,8 @@ staging; 24 / 12 / 6 in prod.
 make secrets && make dev-up                    # Kafka, registry, ClickHouse, Flink
 docker compose --profile sim up -d producer    # 1,000 events/s
 make latency                                   # end-to-end p50/p95/p99, last minute
-make test                                      # Spark suite + Flink suite
+make test                                      # Spark, Flink and Airflow suites
+make airflow-up                                # + Airflow on :8080, producer at 100/s
 make cluster-up && make deploy ENV=staging     # k3d: Strimzi + Flink operator
 ```
 
@@ -386,24 +423,38 @@ Verified by running, not just written.
   TaskManager decides ~4,100 events/s reading from Kafka, two ~5,500 on
   one shared laptop VM
 
-**Detection**
-- Measured on the Spark path over ~33,000 labelled events: 98.9% of attack
-  events blocked; the only "normal" events blocked (0.32%) were the
-  compromised hosts' own traffic during their attacks
-- Same logic on the Flink path, held equal by the parity test; in a
-  10-minute run at 1,000 events/s: 576,843 allowed, 16,654 blocked, every
-  attack family firing its rule
+**Detection** (`make evaluate`, Flink path, 1,000 events/s, 15 minutes,
+879,721 events)
+- Every event decided (coverage 100%, no copies); 29 of 29 attacks caught,
+  99.3% of attack events blocked; the first flag 0.4–1.6 s into an attack
+  from a new source, at once for a source already seen attacking
+- 297 normal events blocked (0.034%): 290 were compromised workstations'
+  own traffic during or just after their attack (containment), **7** were
+  real false positives — busy remote VPN hosts whose ordinary failed logins
+  reach 20 in 5 minutes, so their next success trips
+  `login_after_brute_force`
+- Earlier, on the Spark path over ~33,000 events: 98.9% of attack events
+  blocked; the parity test holds both engines to identical decisions
 
 **Storage and queries**
 - New `security_events` layout: analyst drill-downs 20–600x less data read
 - Dead-letter routing for every wire and validation error; parse errors at
   the ClickHouse intake routed there too
 
+**Orchestration** ([`orchestration.md`](orchestration.md))
+- Airflow 3.3 in dev: the pipeline DAG green on a live stack, red at
+  `extract` with the producer stopped, red at `stream_job` with no
+  TaskManager; hourly checks; a daily rollup backfilled for a real day
+  (2,144,887 events, summary = stored); detection quality passing (6/6
+  attacks, 1.02 s median first flag); ~0.5 GB with a task running
+
 **Engineering**
-- Tests: 194 in the Spark image (unit, parity, 11 streaming-replay) and 27
-  in the Flink image (the real job on a local Flink mini-cluster, both
-  execution modes); lint clean
-- Metrics, 17 alert rules, a Grafana dashboard with a streaming-path row
+- Tests: 194 in the Spark image (unit, parity, 11 streaming-replay) plus 28
+  orchestration ops tests, 27 in the Flink image (the real job on a local
+  Flink mini-cluster, both execution modes), 42 in the Airflow image (ops,
+  evaluator, DAG structure); lint clean
+- Metrics, 19 alert rules, a Grafana dashboard with a streaming-path row and
+  a between-step data-quality panel
 - Secrets as mounted files; CI workflow for lint, both test suites, the
   schema gate and manifests
 
@@ -464,7 +515,10 @@ on one node, object storage needed across nodes), a ~3 GB Flink image.
 **Old table kept.** `security_events_before_relayout` (2.85 GB) holds the
 data in the previous layout until someone decides it can be dropped.
 
-**CI has never run on GitHub** — nothing is pushed; `make ci` runs locally.
+**CI has never run on GitHub** — `make ci` runs locally.
+
+**Orchestration**: no failure notifications, one admin user, the Kubernetes
+component not yet run on a cluster ([`orchestration.md`](orchestration.md) §6).
 
 ---
 
@@ -476,6 +530,8 @@ data in the previous layout until someone decides it can be dropped.
    latency stays under 200 ms
 3. Bring the LLM to the live path with an asynchronous operator: rule-
    decided rows unchanged, grey-zone rows updated when the verdict arrives
-4. Re-run `make evaluate` against the Flink path's output
-5. A user-keyed feature pass for credential stuffing
-6. Set a Groq key and measure LLM cost and quality on the grey zone
+4. A user-keyed feature pass for credential stuffing; review
+   `login_after_brute_force` for remote staff (7 false positives, above)
+5. Set a Groq key and measure LLM cost and quality on the grey zone
+6. Orchestrate Spark replays from Airflow, and send Airflow failures
+   somewhere a person sees them

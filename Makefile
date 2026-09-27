@@ -14,6 +14,8 @@ TEST_IMAGE     := watchtower/spark:test
 PRODUCER_IMAGE := watchtower/producer:1.0
 FLINK_IMAGE    := watchtower/flink:2.2.1
 FLINK_TEST     := watchtower/flink:test
+AIRFLOW_IMAGE  := watchtower/airflow:3.3.2
+AIRFLOW_TEST   := watchtower/airflow:test
 CLUSTER        := watchtower
 ENV            ?= staging
 NS             := watchtower-$(ENV)
@@ -25,7 +27,8 @@ NODE           := k3d-$(CLUSTER)-server-0
 
 # Every image the cluster runs. All are loaded from the host, so nothing
 # inside the cluster pulls from the internet.
-CLUSTER_IMAGES := $(FLINK_IMAGE) $(SPARK_IMAGE) $(PRODUCER_IMAGE) \
+CLUSTER_IMAGES := $(FLINK_IMAGE) $(SPARK_IMAGE) $(PRODUCER_IMAGE) $(AIRFLOW_IMAGE) \
+                  postgres:18.6-alpine \
                   ghcr.io/apache/flink-kubernetes-operator:1c895a3 \
                   ghcr.io/aiven-open/karapace:6.2.3 \
                   clickhouse/clickhouse-server:25.8.33 \
@@ -48,7 +51,7 @@ secrets:  ## Generate missing local secret files (never overwrites)
 ##@ Images
 
 .PHONY: images
-images: image-flink image-spark image-producer  ## Build all runtime images
+images: image-flink image-spark image-producer image-airflow  ## Build all runtime images
 
 .PHONY: image-flink
 image-flink:  ## Build the Flink streaming image (the live path)
@@ -57,6 +60,14 @@ image-flink:  ## Build the Flink streaming image (the live path)
 .PHONY: image-flink-test
 image-flink-test:  ## Build the Flink test image
 	docker build --target test -t $(FLINK_TEST) -f docker/flink/Dockerfile .
+
+.PHONY: image-airflow
+image-airflow:  ## Build the Airflow image (orchestration: data quality, rollups, evaluation)
+	docker build --target runtime -t $(AIRFLOW_IMAGE) -f docker/airflow/Dockerfile .
+
+.PHONY: image-airflow-test
+image-airflow-test:  ## Build the Airflow test image
+	docker build --target test -t $(AIRFLOW_TEST) -f docker/airflow/Dockerfile .
 
 .PHONY: image-spark
 image-spark:  ## Build the Spark runtime image
@@ -74,19 +85,23 @@ image-producer:  ## Build the producer image
 
 .PHONY: lint
 lint: image-test  ## Ruff: pyflakes + syntax errors
-	docker run --rm $(TEST_IMAGE) python3 -m ruff check etl tools schemas tests producer
+	docker run --rm $(TEST_IMAGE) python3 -m ruff check etl tools schemas tests producer orchestration
 
 .PHONY: test-unit
 test-unit: image-test  ## Unit tests
 	docker run --rm $(TEST_IMAGE) python3 -m pytest -q -m "not integration"
 
 .PHONY: test
-test: image-test test-flink  ## Unit + integration tests (Spark replay, Flink job)
+test: image-test test-flink test-airflow  ## Unit + integration tests (Spark replay, Flink job, DAGs)
 	docker run --rm $(TEST_IMAGE) python3 -m pytest -q
 
 .PHONY: test-flink
 test-flink: image-flink-test  ## The Flink job end to end on a local mini-cluster
 	docker run --rm $(FLINK_TEST) python3 -m pytest -q -p no:cacheprovider tests/flink tests/unit/test_processor.py
+
+.PHONY: test-airflow
+test-airflow: image-airflow-test  ## The DAGs parse and are wired as documented; their ops and the evaluator
+	docker run --rm $(AIRFLOW_TEST)
 
 .PHONY: render
 render:  ## Render both overlays -- catches broken manifests without a cluster
@@ -110,7 +125,17 @@ dev-up: secrets image-flink image-spark  ## Start the dev stack (Flink live path
 
 .PHONY: dev-down
 dev-down:  ## Stop the dev stack (keeps volumes)
-	docker compose --profile sim down
+	docker compose --profile sim --profile airflow down
+
+# The producer runs at 100/s here, not 1,000: the 1,000/s stack alone fills
+# a ~4 GB Docker VM's swap, and Airflow needs ~0.5 GB while a task runs.
+.PHONY: airflow-up
+airflow-up: secrets image-flink image-airflow  ## Dev stack + Airflow (producer at 100/s); UI on :8080
+	LOGS_PER_SECOND=$${LOGS_PER_SECOND:-100} docker compose --profile sim --profile airflow up -d
+	@docker exec -i watchtower-clickhouse sh -c \
+	  'clickhouse-client --user watchtower --password "$$(cat /run/secrets/clickhouse_password)" --multiquery' \
+	  < clickhouse/init/04_orchestration.sql
+	@echo "airflow ui: http://localhost:8080   (admin / secrets/airflow_admin_password)"
 
 .PHONY: dev-logs
 dev-logs:  ## Follow the streaming job's logs
@@ -155,6 +180,13 @@ ch-migrate-k8s:  ## Apply clickhouse/init/*.sql to ENV's ClickHouse (idempotent)
 	  kubectl -n $(NS) exec -i clickhouse-0 -- sh -c \
 	    'clickhouse-client --user watchtower --password "$$CLICKHOUSE_PASSWORD" --multiquery' < $$f || exit 1; \
 	done
+
+.PHONY: pipeline-health
+pipeline-health:  ## The latest end-to-end verdict from Airflow, stage by stage (dev)
+	@docker exec watchtower-clickhouse sh -c 'clickhouse-client --user watchtower --password "$$(cat /run/secrets/clickhouse_password)" -q "\
+	  SELECT stage, check_name, if(passed, '\''ok'\'', upper(severity)) AS result, detail FROM watchtower.pipeline_health \
+	  WHERE run_id = (SELECT argMax(run_id, checked_at) FROM watchtower.pipeline_health) \
+	  ORDER BY stage, check_name FORMAT PrettyCompactMonoBlock"'
 
 .PHONY: evaluate
 evaluate:  ## Detection vs ground truth: allow/alert/block per scenario (dev)
@@ -268,6 +300,10 @@ status:  ## Pods, brokers and memory for ENV
 .PHONY: grafana
 grafana:  ## Grafana on http://localhost:3000 (admin / secrets/grafana_admin_password)
 	kubectl -n $(NS) port-forward svc/grafana 3000:3000
+
+.PHONY: airflow-ui
+airflow-ui:  ## Airflow on http://localhost:8080 (admin / secrets/airflow_admin_password)
+	kubectl -n $(NS) port-forward svc/airflow-api-server 8080:8080
 
 .PHONY: prometheus
 prometheus:  ## Prometheus on http://localhost:9090

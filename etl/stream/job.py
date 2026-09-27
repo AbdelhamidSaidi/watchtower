@@ -70,6 +70,7 @@ from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor  #
 from pyflink.table import StreamTableEnvironment  # noqa: E402
 
 import config  # noqa: E402
+from core import dq  # noqa: E402
 from core.latency import LatencyWindow  # noqa: E402
 from core.processor import SourceState  # noqa: E402
 from core.records import Decoder, enrich, normalize, reject_reason, rejected_row  # noqa: E402
@@ -97,6 +98,35 @@ class BatchedCounter:
         if self._pending:
             self._counter.inc(self._pending)
             self._pending = 0
+
+
+class IssueCounters:
+    """Data-quality counters between the steps (core/dq.py), batched like
+    the rest: `dq_<step>_<issue>`. Every known issue is registered up front
+    so it exports 0 until it happens -- a rate of an absent series is
+    nothing, a rate of 0 is "fine"."""
+
+    def __init__(self, group, steps):
+        self.group = group
+        self.counters = {}
+        for step in steps:
+            for issue in dq.ISSUES.get(step, ()):
+                self._counter(step, issue)
+
+    def _counter(self, step, issue):
+        key = f"dq_{step}_{issue}"
+        counter = self.counters.get(key)
+        if counter is None:
+            counter = self.counters[key] = BatchedCounter(self.group, key)
+        return counter
+
+    def count(self, step, issues):
+        for issue in issues:
+            self._counter(step, issue).inc()
+
+    def flush(self):
+        for counter in self.counters.values():
+            counter.flush()
 
 
 class PushedGauge:
@@ -304,22 +334,42 @@ class ParseValidate(ProcessFunction):
         self.decoder = Decoder(self.versions)
         group = runtime_context.get_metrics_group().add_group("watchtower")
         self.rejected = group.counter("rejected_events")
+        # Rejects by reason (dq_validate_<reason>, created as reasons appear)
+        # and doubtful events that got through, after normalize and enrich.
+        self.dq = IssueCounters(group, ("normalize", "enrich"))
+        self.pushed_at = 0
 
     def process_element(self, row, ctx):
         raw, topic, partition, offset, kafka_ts = row[0], row[1], row[2], row[3], row[4]
         event, wire_error, schema_id = self.decoder.decode(raw)
         event = event or {}
         reason = reject_reason(event, wire_error)
+        now_ms = int(time.time() * 1000)
         if reason:
             self.rejected.inc()
+            self.dq.count("validate", (reason,))
+            self._push_metrics(now_ms)
             yield REJECTED, json.dumps(
                 rejected_row(reason, schema_id, raw, topic, partition, offset, _as_utc(kafka_ts))
             )
             return
-        event = enrich(normalize(event))
+        raw_severity = event.get("severity")
+        event = normalize(event)
+        self.dq.count("normalize", dq.after_normalize(raw_severity, event))
+        event = enrich(event)
+        self.dq.count("enrich", dq.after_enrich(event, now_ms, int(event["_ts"].timestamp() * 1000)))
+        self._push_metrics(now_ms)
         # Kafka append time, for the pipeline-only latency metric below.
         event["_kafka_ms"] = int(_as_utc(kafka_ts).timestamp() * 1000)
         yield event
+
+    def _push_metrics(self, now_ms):
+        if now_ms - self.pushed_at >= METRICS_PUSH_MS:
+            self.pushed_at = now_ms
+            self.dq.flush()
+
+    def close(self):
+        self.dq.flush()
 
 
 def _idle_check_at(now_ms, key):
@@ -366,7 +416,8 @@ class DetectPerSource(KeyedProcessFunction):
         self.duplicates = BatchedCounter(group, "duplicate_events")
         self.forgotten = BatchedCounter(group, "idle_sources_cleared")
         self.actions = {a: BatchedCounter(group, f"action_{a}") for a in ("allow", "alert", "block")}
-        self.counters = [self.scored, self.duplicates, self.forgotten, *self.actions.values()]
+        self.dq = IssueCounters(group, ("features", "rules"))
+        self.counters = [self.scored, self.duplicates, self.forgotten, *self.actions.values(), self.dq]
         # Two latencies, as rolling p50/p95/max over the last 2,000 events:
         #   event_age      event timestamp -> scored: includes the source's
         #                  own delay before Kafka (producer clock vs ours --
@@ -414,6 +465,8 @@ class DetectPerSource(KeyedProcessFunction):
         self.store.save()
         self.scored.inc()
         self.actions[row["recommended_action"]].inc()
+        self.dq.count("features", dq.after_features(row))
+        self.dq.count("rules", dq.after_rules(row))
         now_ms = int(time.time() * 1000)
         self.latency["event_age"].add(now_ms - int(event["_ts"].timestamp() * 1000))
         self.latency["kafka_to_scored"].add(now_ms - event["_kafka_ms"])

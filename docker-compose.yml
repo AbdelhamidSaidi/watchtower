@@ -293,7 +293,82 @@ services:
     environment:
       KAFKA_BROKER: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      LOGS_PER_SECOND: 1000
+      LOGS_PER_SECOND: ${LOGS_PER_SECOND:-1000}
+    restart: unless-stopped
+
+  # --- orchestration (profile: airflow) -------------------------------------
+  # Airflow runs the batch side around the stream (orchestration/dags):
+  # hourly data-quality checks, the daily rollup, detection-quality
+  # evaluation. Opt-in: with its database it takes ~0.3 GB idle and ~0.5 GB
+  # while a task runs (measured) -- room a ~4 GB Docker VM has with the
+  # producer at 100 events/s, not at 1,000 (that stack alone fills swap):
+  #   LOGS_PER_SECOND=100 docker compose --profile sim --profile airflow up -d
+  # UI: http://localhost:8080  (admin / secrets/airflow_admin_password)
+  airflow-db:
+    profiles: [airflow]
+    image: postgres:18.6-alpine
+    container_name: watchtower-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+      POSTGRES_PASSWORD_FILE: /run/secrets/airflow_db_password
+    secrets:
+      - airflow_db_password
+    volumes:
+      - airflow-db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # API server, scheduler and DAG processor in one container (start.sh);
+  # Kubernetes runs them as separate pods (components/airflow).
+  airflow:
+    profiles: [airflow]
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+      target: runtime
+    image: watchtower/airflow:3.3.2
+    container_name: watchtower-airflow
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"   # UI + API
+    environment:
+      # Airflow runs these commands to read the values, so the password and
+      # the signing key stay in mounted files.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_CMD: >-
+        sh -c 'printf "postgresql+psycopg2://airflow:%s@airflow-db/airflow" "$$(cat /run/secrets/airflow_db_password)"'
+      AIRFLOW__API_AUTH__JWT_SECRET_CMD: cat /run/secrets/airflow_jwt_secret
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://localhost:8080/execution/
+      AIRFLOW__CORE__PARALLELISM: 2
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+      FLINK_REST_URL: http://flink-jobmanager:8081
+      WATCHTOWER_SYNTHETIC_TRAFFIC: "true"
+    secrets:
+      - clickhouse_password
+      - airflow_db_password
+      - airflow_jwt_secret
+      - airflow_admin_password
+    volumes:
+      # Edit a DAG or its ops and the change is live within a minute, no
+      # rebuild. The image carries the same files for Kubernetes.
+      - ./orchestration:/opt/watchtower/orchestration:ro
+      - ./tools/evaluate_detection.py:/opt/watchtower/tools/evaluate_detection.py:ro
+      - airflow-logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
     restart: unless-stopped
 
 secrets:
@@ -301,9 +376,17 @@ secrets:
     file: ./secrets/clickhouse_password
   groq_api_key:
     file: ./secrets/groq_api_key
+  airflow_db_password:
+    file: ./secrets/airflow_db_password
+  airflow_jwt_secret:
+    file: ./secrets/airflow_jwt_secret
+  airflow_admin_password:
+    file: ./secrets/airflow_admin_password
 
 volumes:
   kafka-data:
   clickhouse-data:
   checkpoints:
   flink-checkpoints:
+  airflow-db:
+  airflow-logs:

@@ -16,6 +16,9 @@ resources:
   - namespace.yaml
   - ../../base
 
+components:
+  - ../../components/airflow
+
 configMapGenerator:
   - name: pipeline-env
     behavior: merge

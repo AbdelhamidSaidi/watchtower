@@ -18,9 +18,9 @@ mkdir -p "$DIR"
 chmod 700 "$DIR"
 
 generate() {
-  local file="$DIR/$1"
+  local file="$DIR/$1" bytes="${2:-24}"
   if [ ! -s "$file" ] && [ "$1" != groq_api_key ]; then
-    python3 -c 'import secrets; print(secrets.token_urlsafe(24), end="")' > "$file"
+    python3 -c "import secrets; print(secrets.token_urlsafe($bytes), end='')" > "$file"
     echo "generated secrets/$1"
   elif [ ! -e "$file" ]; then
     : > "$file"
@@ -32,6 +32,11 @@ generate() {
 generate clickhouse_password
 generate grafana_admin_password
 generate groq_api_key
+generate airflow_db_password
+generate airflow_admin_password
+# Signs the tokens Airflow's components hand each other (HS512): 64 bytes,
+# the hash's own size.
+generate airflow_jwt_secret 64
 
 if [ "${1:-}" != "" ]; then
   kubectl create namespace "$1" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -39,6 +44,9 @@ if [ "${1:-}" != "" ]; then
     --from-file=clickhouse_password="$DIR/clickhouse_password" \
     --from-file=grafana_admin_password="$DIR/grafana_admin_password" \
     --from-file=groq_api_key="$DIR/groq_api_key" \
+    --from-file=airflow_db_password="$DIR/airflow_db_password" \
+    --from-file=airflow_admin_password="$DIR/airflow_admin_password" \
+    --from-file=airflow_jwt_secret="$DIR/airflow_jwt_secret" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   echo "secret watchtower-secrets applied to $1"
 fi
