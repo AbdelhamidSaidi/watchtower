@@ -12,6 +12,9 @@ RUN pip install --no-cache-dir --timeout 120 --retries 10 -r /tmp/requirements.t
 
 COPY --chown=10001:10001 schemas /app/schemas
 COPY --chown=10001:10001 producer /app/producer
+# The schema CLI: schema-init registers the schema with this image
+# (docker-compose.yml, deploy/k8s/base/schema-registry.yaml).
+COPY --chown=10001:10001 tools/schema_registry.py /app/tools/schema_registry.py
 
 USER 10001
 WORKDIR /app

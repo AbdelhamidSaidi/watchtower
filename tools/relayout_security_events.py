@@ -18,7 +18,7 @@ ClickHouse cannot change a table's sorting key in place, so this:
   5. KEEPS the old data as security_events_before_relayout. Drop it
      yourself once you are satisfied.
 
-Stop the writers first (the Flink job, or the Spark pipeline): rows that
+Stop the writer first (the Flink job): rows that
 arrive during the copy would land only in the old table. Re-runnable: it
 resumes from whatever step it reached.
 """

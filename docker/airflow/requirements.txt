@@ -9,3 +9,7 @@ asyncpg==0.31.0
 # Kafka. Same versions as the producer (producer/requirements.txt).
 kafka-python==3.0.11
 fastavro==1.12.2
+
+# watchtower_training: trains the stream's model (etl/core/ml.py scores it,
+# compiled, without this library). numpy/scipy come from the constraints.
+lightgbm==4.7.0

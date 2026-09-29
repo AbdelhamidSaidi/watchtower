@@ -1,10 +1,9 @@
-"""Rules + the combined decision: what must be stopped, and why."""
+"""core/rules: what must be stopped, and why -- one event at a time, as the
+Flink job scores it."""
 
-import pandas as pd
 import pytest
 
-from detect.rules import action_for, apply_rules
-from detect.score import make_scorer
+from core.rules import action_for, score_event
 
 QUIET = dict(
     source_ip="192.168.1.10", event_type="HTTP_REQUEST", is_internal_ip=1,
@@ -19,13 +18,8 @@ QUIET = dict(
 )
 
 
-def _row(**overrides):
-    return dict(QUIET, **overrides)
-
-
-def _decide(*rows):
-    out = make_scorer(llm=None)(pd.DataFrame(list(rows)))
-    return out.to_dict("records")
+def decide(**overrides):
+    return score_event(dict(QUIET, **overrides))
 
 
 @pytest.mark.parametrize(
@@ -46,13 +40,13 @@ def _decide(*rows):
     ],
 )
 def test_each_attack_is_blocked_with_its_reason(overrides, rule):
-    [decision] = _decide(_row(**overrides))
+    decision = decide(**overrides)
     assert decision["recommended_action"] == "block"
     assert rule in decision["rule_hits"].split(",")
 
 
 def test_normal_traffic_is_allowed():
-    [decision] = _decide(_row())
+    decision = decide()
     assert decision["recommended_action"] == "allow"
     assert decision["rule_hits"] == ""
 
@@ -68,84 +62,21 @@ def test_normal_traffic_is_allowed():
     ],
 )
 def test_benign_look_alikes_are_not_blocked(overrides):
-    [decision] = _decide(_row(**overrides))
-    assert decision["recommended_action"] == "allow"
+    assert decide(**overrides)["recommended_action"] == "allow"
 
 
 def test_a_single_sensitive_path_probe_alerts_but_does_not_block():
-    [decision] = _decide(_row(is_internal_ip=0, is_sensitive_path=1, http_status=404,
-                              url_path="/.env"))
+    decision = decide(is_internal_ip=0, is_sensitive_path=1, http_status=404, url_path="/.env")
     assert decision["recommended_action"] == "alert"
 
 
 def test_every_rule_that_fired_is_recorded_strongest_first():
-    [decision] = _decide(_row(request_signature="sqli", is_attack_signature=1, is_scanner_agent=1))
+    decision = decide(request_signature="sqli", is_attack_signature=1, is_scanner_agent=1)
     assert decision["rule_hits"] == "sqli,scanner_agent"
     assert decision["final_anomaly_score"] == pytest.approx(0.95)
-
-
-def test_attacks_are_blocked_with_no_api_key_at_all():
-    """Rules need no API. Signature attacks are stopped even with Groq down."""
-    [decision] = _decide(_row(request_signature="sqli", is_attack_signature=1))
-    assert decision["recommended_action"] == "block"
-    assert decision["llm_reason"] == "skipped:rule_decided"
-
-
-def test_the_llm_is_never_paid_for_what_the_rules_already_decided():
-    class Spy:
-        model = "spy"
-        seen = []
-
-        def score_frame(self, pdf):
-            Spy.seen.extend(pdf["url_path"])
-            pdf = pdf.copy()
-            pdf["llm_score"], pdf["llm_reason"], pdf["llm_model"] = 0.0, "x", "spy"
-            return pdf
-
-    make_scorer(llm=Spy())(pd.DataFrame([
-        _row(url_path="/inj", request_signature="sqli", is_attack_signature=1),
-        _row(url_path="/grey", is_internal_ip=0, is_sensitive_path=1, http_status=404),
-    ]))
-    assert Spy.seen == ["/grey"]
-
-
-def test_final_score_is_the_max_not_the_average():
-    """An alert-level rule hit (0.70) must survive an LLM that shrugs (0.20).
-    Averaged, it would fall to 0.45 -- below the alert line -- and be allowed."""
-
-    class Shrugs:
-        model = "m"
-
-        def score_frame(self, pdf):
-            pdf = pdf.copy()
-            pdf["llm_score"], pdf["llm_reason"], pdf["llm_model"] = 0.2, "looks fine", "m"
-            return pdf
-
-    probe = _row(is_internal_ip=0, is_sensitive_path=1, http_status=404, url_path="/.env")
-    [row] = make_scorer(llm=Shrugs())(pd.DataFrame([probe])).to_dict("records")
-    assert row["final_anomaly_score"] == pytest.approx(0.70)
-    assert row["recommended_action"] == "alert"
-
-
-def test_the_llm_can_escalate_what_no_rule_caught():
-    class Alarmed:
-        model = "m"
-
-        def score_frame(self, pdf):
-            pdf = pdf.copy()
-            pdf["llm_score"], pdf["llm_reason"], pdf["llm_model"] = 0.9, "odd sequence", "m"
-            return pdf
-
-    [row] = make_scorer(llm=Alarmed())(pd.DataFrame([_row()])).to_dict("records")
-    assert row["recommended_action"] == "block"
 
 
 def test_action_thresholds():
     assert action_for(0.95) == "block"
     assert action_for(0.70) == "alert"
     assert action_for(0.30) == "allow"
-
-
-def test_empty_batch():
-    scores, hits = apply_rules(pd.DataFrame())
-    assert scores.empty and hits.empty

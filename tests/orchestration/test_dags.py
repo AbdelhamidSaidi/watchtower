@@ -27,7 +27,7 @@ def load(monkeypatch, synthetic):
 def test_all_dags_parse_where_traffic_is_synthetic(monkeypatch):
     assert set(load(monkeypatch, synthetic=True)) == {
         "watchtower_pipeline", "watchtower_data_quality", "watchtower_daily",
-        "watchtower_detection_quality",
+        "watchtower_detection_quality", "watchtower_review", "watchtower_training",
     }
 
 
@@ -90,3 +90,19 @@ def test_detection_quality_records_before_the_gate(monkeypatch):
     assert downstream(dag, "evaluate") == {"assess", "record"}
     assert downstream(dag, "record") == {"gate"}
     assert dag.params["minutes"] == 15
+
+
+def test_review_judges_then_learns_and_alerts(monkeypatch):
+    dag = load(monkeypatch, synthetic=True)["watchtower_review"]
+    assert downstream(dag, "select") == {"judge"}
+    assert downstream(dag, "judge") == {"learn", "urgent", "guard"}
+    # New labels are what start a retraining.
+    assert [a.name for a in dag.get_task("learn").outlets] == ["watchtower_training_labels"]
+    # On real traffic collect_labels is skipped; the review must still run.
+    assert downstream(dag, "collect_labels") == {"judge"}
+    assert dag.get_task("judge").trigger_rule == "none_failed"
+
+
+def test_training_starts_when_the_reviewer_adds_labels(monkeypatch):
+    dag = load(monkeypatch, synthetic=True)["watchtower_training"]
+    assert "watchtower_training_labels" in repr(dag.timetable)

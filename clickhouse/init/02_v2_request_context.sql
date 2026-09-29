@@ -56,7 +56,7 @@ TO watchtower.suspicious_events
 AS
 SELECT
     event_id, timestamp, source_ip, user, event_type, hostname,
-    recommended_action, rule_hits, rule_score, llm_score, llm_reason,
+    recommended_action, rule_hits, rule_score, ml_score, ml_reason,
     final_anomaly_score, url_path, user_agent, command, process_uid
 FROM watchtower.security_events
 WHERE is_suspicious = 1;

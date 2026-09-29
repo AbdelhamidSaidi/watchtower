@@ -66,15 +66,13 @@ EVENT_COLUMNS = [
     "bytes_sent_5m",
 ]
 
-# Added to the pandas frame by the detector, not present on the Spark
-# DataFrame. Scoring happens here on the driver rather than on executors so
-# there is ONE rate limiter and ONE verdict cache, not one per executor.
+# Added by scoring (core/rules.py).
 SCORE_COLUMNS = [
     "rule_score",
     "rule_hits",
-    "llm_score",
-    "llm_reason",
-    "llm_model",
+    "ml_score",
+    "ml_reason",
+    "ml_model",
     "final_anomaly_score",
     "is_suspicious",
     "recommended_action",

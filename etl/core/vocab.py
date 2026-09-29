@@ -52,8 +52,8 @@ KNOWN_EVENT_TYPES = [
 MAX_PORT = 65535
 
 # event_id lands in a ClickHouse UUID column. Anything else would fail the
-# insert -- for the whole batch in Spark, or stall the ClickHouse consumer
-# in the streaming path -- so it is rejected up front instead.
+# insert and stall the ClickHouse consumer, so it is rejected up front
+# instead.
 UUID_REGEX = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 
 # Everything the producer can put in `severity`. Anything else becomes

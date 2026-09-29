@@ -24,13 +24,6 @@ configMapGenerator:
     behavior: merge
     literals:
       - LOGS_PER_SECOND=1000
-      # Used only if the Spark component is added (components/spark-pipeline)
-      - SPARK_EXECUTORS=auto
-      - SPARK_MIN_EXECUTORS=1
-      - SPARK_MAX_EXECUTORS=3
-      - SPARK_DRIVER_MEMORY=512m
-      - WATCHTOWER_SHUFFLE_PARTITIONS=6
-      - KAFKA_MAX_OFFSETS_PER_TRIGGER=60000
 
 patches:
   # One ~4 GB node: at most 3 TaskManagers (1 GiB each) next to Kafka,

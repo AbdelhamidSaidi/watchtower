@@ -83,6 +83,24 @@ CHECKS = (
           f"         WHERE timestamp >= {START} - INTERVAL 7 DAY AND timestamp < {START}) AS w)"),
 )
 
+# Population stability index of the model's scores: this hour against the
+# trailing week, over ten score bands. Under 0.1 is stable, 0.1-0.25 a
+# shift worth watching, above 0.25 the traffic the model sees is no longer
+# the traffic it was judged on -- retrain, or find out what changed.
+_BANDS = "least(toUInt8(ml_score * 10), 9)"
+CHECKS += (
+    Check("ml_score_drift_psi", "warn", "<=", 0.25,
+          "population stability of the model's scores, the hour vs the trailing 7 days",
+          "SELECT if(count() = 0, NULL, sum((h - w) * log(h / w))) FROM ("
+          " SELECT (ifNull(hc, 0) + 0.5) / (sum(ifNull(hc, 0)) OVER () + 5) AS h,"
+          "        (ifNull(wc, 0) + 0.5) / (sum(ifNull(wc, 0)) OVER () + 5) AS w"
+          f" FROM (SELECT {_BANDS} AS b, count() AS hc FROM {EVENTS}"
+          f"       WHERE {IN_HOUR} AND ml_model != '' GROUP BY b) AS hour"
+          f" FULL OUTER JOIN (SELECT {_BANDS} AS b, count() AS wc FROM {EVENTS}"
+          f"       WHERE timestamp >= {START} - INTERVAL 7 DAY AND timestamp < {START} AND ml_model != ''"
+          "       GROUP BY b) AS week USING (b))"),
+)
+
 BY_NAME = {check.name: check for check in CHECKS}
 NAMES = [check.name for check in CHECKS]
 

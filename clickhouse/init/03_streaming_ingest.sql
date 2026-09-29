@@ -83,9 +83,9 @@ CREATE TABLE IF NOT EXISTS watchtower.security_events_queue
     bytes_sent_5m          UInt64,
     rule_score             Float32,
     rule_hits              String,
-    llm_score              Float32,
-    llm_reason             String,
-    llm_model              LowCardinality(String),
+    ml_score               Float32,
+    ml_reason              String,
+    ml_model               LowCardinality(String),
     final_anomaly_score    Float32,
     is_suspicious          UInt8,
     recommended_action     LowCardinality(String)

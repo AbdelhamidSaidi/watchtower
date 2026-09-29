@@ -121,13 +121,26 @@ spec:
           envFrom:
             - configMapRef:
                 name: pipeline-env
+          env:
+            # The active ML model is read from ClickHouse (etl/stream/models.py).
+            - name: CLICKHOUSE_PASSWORD_FILE
+              value: /run/secrets/clickhouse_password
           volumeMounts:
             - name: flink-data
               mountPath: /flink-data
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
       volumes:
         - name: flink-data
           persistentVolumeClaim:
             claimName: flink-data
+        - name: secrets
+          secret:
+            secretName: watchtower-secrets
+            items:
+              - key: clickhouse_password
+                path: clickhouse_password
   jobManager:
     resource:
       memory: 768m

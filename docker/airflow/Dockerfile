@@ -16,6 +16,11 @@ FROM apache/airflow:slim-${AIRFLOW_VERSION}-python${PYTHON_VERSION} AS runtime
 ARG AIRFLOW_VERSION
 ARG PYTHON_VERSION
 
+# LightGBM (watchtower_training) needs the OpenMP runtime.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+USER airflow
+
 # Against Airflow's constraints for this exact version: the set its
 # release was tested with, so a provider cannot drag a core dependency
 # somewhere Airflow was never run.
@@ -24,15 +29,17 @@ RUN pip install --no-cache-dir --timeout 120 --retries 10 \
       "apache-airflow==${AIRFLOW_VERSION}" -r /tmp/requirements.txt \
       --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
-# Only what the DAGs import: settings (etl/config.py), the wire contract,
-# the evaluator, and the DAGs with their ops.
+# Only what the DAGs import: settings (etl/config.py), the engine-free
+# detection code (etl/core: training uses the job's own features and scorer),
+# the wire contract, the evaluator, and the DAGs with their ops.
 COPY --chown=airflow:root etl/config.py /opt/watchtower/etl/config.py
+COPY --chown=airflow:root etl/core /opt/watchtower/etl/core
 COPY --chown=airflow:root schemas /opt/watchtower/schemas
 COPY --chown=airflow:root tools/evaluate_detection.py /opt/watchtower/tools/evaluate_detection.py
 COPY --chown=airflow:root orchestration /opt/watchtower/orchestration
 COPY --chown=airflow:root --chmod=755 docker/airflow/start.sh /opt/watchtower/start.sh
 
-ENV PYTHONPATH=/opt/watchtower \
+ENV PYTHONPATH=/opt/watchtower:/opt/watchtower/etl \
     AIRFLOW__CORE__DAGS_FOLDER=/opt/watchtower/orchestration/dags \
     AIRFLOW__CORE__LOAD_EXAMPLES=False \
     AIRFLOW__CORE__EXECUTOR=LocalExecutor \

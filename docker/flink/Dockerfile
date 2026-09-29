@@ -1,5 +1,5 @@
-# The streaming job: Flink 2.2 + PyFlink, running the same etl/core logic
-# the tests prove against the Spark path.
+# The streaming job: Flink 2.2 + PyFlink, running the etl/core logic. The
+# `test` stage also runs the engine-free tests and ruff (make test, make lint).
 #
 # One image for every Flink role (jobmanager, taskmanager) in compose and
 # in Kubernetes.
@@ -50,11 +50,19 @@ ENV PYTHONPATH=/opt/watchtower/etl:/opt/watchtower
 
 USER flink
 
-# --- test: the job's own tests, on a local Flink mini-cluster -----------
+# --- test: the unit tests, the job on a local Flink mini-cluster, lint ----
 FROM runtime AS test
 USER root
-RUN pip3 install --no-cache-dir --timeout 120 --retries 10 --break-system-packages pytest
+# LightGBM (to prove the compiled scorer equals it) needs the OpenMP runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir --timeout 120 --retries 10 --break-system-packages \
+      pytest==9.1.1 ruff==0.16.8 lightgbm==4.7.0
 COPY --chown=flink:flink pyproject.toml /opt/watchtower/pyproject.toml
 COPY --chown=flink:flink tests /opt/watchtower/tests
+# Linted with everything else (make lint); their own tests run in the
+# Airflow image.
+COPY --chown=flink:flink tools /opt/watchtower/tools
+COPY --chown=flink:flink producer /opt/watchtower/producer
+COPY --chown=flink:flink orchestration /opt/watchtower/orchestration
 WORKDIR /opt/watchtower
 USER flink

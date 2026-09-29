@@ -128,11 +128,12 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: register
-          image: watchtower/spark:3.5.9
+          # The producer image: Python + fastavro, the same schemas/ code.
+          image: watchtower/producer:1.0
           imagePullPolicy: IfNotPresent
           command:
             - python3
-            - /opt/watchtower/tools/schema_registry.py
+            - /app/tools/schema_registry.py
             - register
             - --url
             - http://schema-registry:8081

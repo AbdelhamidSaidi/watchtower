@@ -1,13 +1,10 @@
 """The per-event stages: decode -> validate -> normalize -> enrich.
 
-The same stages as transform/{parse,clean,normalize,enrich}.py, written for
-ONE event at a time instead of a DataFrame -- this is what the Flink job
-runs. Each function mirrors its Spark counterpart rule for rule;
-tests/unit/test_parity.py feeds identical Kafka messages through both and
-requires identical rows.
+ONE event at a time -- this is what the Flink job runs.
 
-Spark's F.trim strips SPACES only, not all whitespace, so `_trim` does the
-same: a tab-only event_id is not blank to Spark, and must not be here.
+`_trim` strips SPACES only, not all whitespace (it began as a mirror of
+Spark's F.trim, and stored rows depend on it): a tab-only event_id is not
+blank.
 """
 
 import base64
@@ -107,7 +104,7 @@ def parse_timestamp(value):
 
     Accepts what the producer writes (datetime.isoformat(), with or without
     microseconds) plus a trailing Z and a space separator. A naive value is
-    UTC, as it is for Spark with spark.sql.session.timeZone=UTC.
+    UTC.
     """
     if not isinstance(value, str):
         return None
@@ -168,7 +165,7 @@ _ZERO = ["target_port", "dest_port", "http_status", "bytes_sent", "response_time
 
 
 def normalize(event):
-    """One canonical spelling per value (transform/normalize.py). In place."""
+    """One canonical spelling per value. In place."""
     for name in _LOWER:
         event[name] = _trim(event.get(name) or "").lower()
     for name in _TEXT:
@@ -193,7 +190,7 @@ def _flag(condition):
 
 
 def enrich(event):
-    """Indicators and GeoIP (transform/enrich.py). In place."""
+    """Indicators and GeoIP. In place."""
     url = event["url_path"]
     if _SQLI.search(url):
         signature = "sqli"

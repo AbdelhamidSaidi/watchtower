@@ -67,12 +67,15 @@ data-quality checks, a daily rollup (deduplicate, summarize, reconcile)
 and a 6-hourly detection-quality evaluation —
 [`orchestration.md`](orchestration.md).
 
-**The Spark pipeline** (`etl/pipeline.py`, `etl/transform/`) is the
-original micro-batch implementation. It is no longer the live path; it
-remains for replays and backfills, and it runs the **same** detection logic
-— `tests/unit/test_parity.py` feeds identical messages through both engines
-and requires identical rows. It is also the only path that currently calls
-the Groq LLM (§2).
+**Detection learns.** Rules and a LightGBM model score every event in
+the stream (~5 µs for the model). Every hour a Groq LLM reviews a sample
+of what was *allowed*; where it disagrees confidently, its verdict becomes
+a training label, and the daily retraining promotes a new model only if it
+measures better (§2, [`orchestration.md`](orchestration.md)).
+
+**One engine.** The project began on Spark micro-batches; Flink replaced it
+for the live path, and Spark has since been removed entirely
+(2026-09-28): one engine, one image, one test suite.
 
 ---
 
@@ -102,28 +105,42 @@ Processing, Spark 4.1 Real-Time Mode) only support stateless queries, and
 detection needs per-source state. Flink processes one event at a time with
 keyed state as a first-class feature. See [`streaming.md`](streaming.md) §1.
 
-### One implementation of the logic, two engines
+### The logic is engine-free
 
 Everything that decides — field contract, validation, normalization,
-indicators, the rolling window, the rules — lives in **`etl/core/`**, plain
-Python with no engine imports. The Flink job and the Spark stages call it or
-mirror it; the parity test holds them equal. A threshold or regex is
+indicators, the rolling window, the rules, the model's scorer — lives in
+**`etl/core/`**, plain Python with no Flink imports. The job wires it into
+operators; the tests run it without a cluster. A threshold or regex is
 defined once.
 
-### Detection: deterministic rules first, an LLM for the grey zone
+### Detection: rules, a model, and an LLM that reviews them
 
-Rules (`etl/core/rules.py`, `etl/detect/rules.py`) score every event:
-signatures (SQL injection, traversal, scanner User-Agents, reverse shells,
-sensitive commands as root) and behaviour (brute force, password spray,
-port scans, web scans, exfiltration volume). `>= 0.85` blocks, `>= 0.65`
-alerts. They need no API key.
+**Rules** (`etl/core/rules.py`) score every event: signatures (SQL
+injection, traversal, scanner User-Agents, reverse shells, sensitive
+commands as root) and behaviour (brute force, password spray, port scans,
+web scans, exfiltration volume). `>= 0.85` blocks, `>= 0.65` alerts.
 
-A Groq-hosted LLM judges what the rules cannot settle — **on the Spark path
-only**, behind a triage gate and a verdict cache (0–3 API calls per batch
-instead of one per event). On the Flink path a remote call per grey-zone
-event would stall that source's stream, so the rules decide alone and the
-row says so (`llm_reason = 'detection_disabled:streaming_rules_only'`).
-Bringing the LLM to the live path needs an asynchronous operator (§10).
+**A LightGBM model** (`etl/core/ml.py`) scores the same event on the same
+features, in the same pass. It is compiled to plain Python when the job
+loads it: ~5 µs per event, identical to LightGBM's own output, where
+`lightgbm.predict` on one row has a 300 µs tail and ONNX Runtime's
+converter breaks PyFlink's dependencies (`tools/bench_model.py`). The
+final score is the higher of the two, but the model alone can only
+**alert**; to **block**, a rule must agree (`WATCHTOWER_ML_CAN_BLOCK`). When
+the model changes a decision, `ml_reason` names the features that drove it.
+
+**An LLM reviews, offline.** A remote call per event would stall the
+stream, so the LLM (Groq) never scores live: every hour it reviews a
+sample of *allowed* events — near-misses, unusual ones, a random sample —
+and of the model's own alerts, and its confident disagreements become
+training labels, both ways (missed attacks, false alarms). New labels
+start a retraining at once. A new model is promoted only if it is at
+least as good on a holdout the reviewer never touched, within
+statistical noise, **and** — the shadow check — would not raise many more
+alerts on its own, or on many more hosts, than the active model when
+both score the last 6 hours of real traffic. The job picks it up within
+5 minutes, no restart; a guard rolls it back if the reviewer calls most
+of its alerts benign; `WATCHTOWER_ML=off` turns the model off.
 
 ### Getting results into ClickHouse through Kafka
 
@@ -197,55 +214,57 @@ simulator's.
 Watchtower/
 ├── Makefile                      every workflow -- `make help`
 ├── docker-compose.yml            DEV: Kafka, Karapace, ClickHouse, Flink (JM + TMs),
-│                                 simulator (profile sim), Spark (profile spark),
-│                                 Airflow + Postgres (profile airflow)
+│                                 simulator (profile sim), Airflow + Postgres
+│                                 (profile airflow)
 ├── schemas/
 │   ├── security_event.avsc       the wire contract (Avro, v2)
 │   └── registry.py               wire format + registry client
 ├── producer/                     company simulation, Avro, keyed by source_ip
 ├── etl/
-│   ├── core/                     ENGINE-FREE logic, used by Flink and Spark:
+│   ├── core/                     ENGINE-FREE logic, run by the Flink job:
 │   │   ├── vocab.py  indicators.py    field contract, regexes, GeoIP table
 │   │   ├── records.py                 decode / validate / normalize / enrich
 │   │   ├── window.py                  RollingWindow (1m + 5m, O(1) per event)
-│   │   ├── rules.py  processor.py     rules; dedup+features+rules per source
+│   │   ├── rules.py  processor.py     rules; dedup+features+rules+model per source
+│   │   ├── ml.py                      the LightGBM model, compiled to Python
+│   │   ├── dq.py                      data quality between the steps
 │   │   └── columns.py  latency.py  startup.py
 │   ├── stream/job.py             THE LIVE PATH: the Flink job
-│   ├── pipeline.py  transform/  extract/  load/  detect/
-│   │                             the Spark path (replays), incl. the Groq detector
-│   ├── scaling/executors.py      Spark executor autoscaler (Spark path only)
-│   ├── observability/metrics.py  Spark driver metrics
+│   ├── stream/models.py          the active model, fetched from ClickHouse
 │   └── config.py                 settings; secrets read from files
 ├── orchestration/
 │   ├── dags/                     Airflow: the pipeline end to end, data quality,
-│   │                             daily rollup, detection quality
+│   │                             daily rollup, detection quality, LLM review,
+│   │                             model training
 │   └── ops/                      what the DAGs do, plain Python
 ├── clickhouse/
 │   ├── init/01_schema.sql        tables (query-optimised layout, skip indexes)
 │   ├── init/02_*.sql  03_*.sql   v2 columns; Kafka-engine ingest + views
+│   ├── init/01b_ml_columns.sql   llm_* -> ml_* on an existing install
 │   ├── init/04_orchestration.sql the tables Airflow writes
+│   ├── init/05_ml.sql            labels, reviews, models, the active model
 │   └── config/                   streaming.xml (broker macro), dev-limits.xml
 ├── tools/
 │   ├── schema_registry.py        the only path a schema reaches the registry
 │   ├── evaluate_detection.py     detection vs ground truth (`make evaluate`, and Airflow)
 │   ├── bench_queries.py          SQL workload benchmark (`make ch-bench`)
+│   ├── bench_model.py            per-event cost of model scoring, by backend
 │   ├── relayout_security_events.py   move data to the new table layout
 │   └── load_test.py  swap_bounded_test.py  drain_test.sh   capacity tests
-├── tests/                        unit, parity, Spark streaming replay, Flink job,
-│                                 orchestration (ops, evaluator, DAG structure)
-├── docker/{flink,spark,producer,airflow}/Dockerfile
+├── tests/                        unit (engine-free), Flink job (mini-cluster),
+│                                 orchestration (ops, ML, evaluator, DAG structure)
+├── docker/{flink,producer,airflow}/Dockerfile
 ├── deploy/
 │   ├── k3d/cluster.yaml
 │   ├── k8s/base/                 Strimzi Kafka (+ Cruise Control, broker HPA),
 │   │                             registry, ClickHouse, FlinkDeployment
 │   │                             (autoscaled), producer, Prometheus, Grafana
-│   ├── k8s/components/spark-pipeline/   the Spark job, opt-in
 │   ├── k8s/components/airflow/   Airflow (scheduler, DAG processor, API server, Postgres)
 │   ├── k8s/overlays/{staging,prod}/
 │   ├── k8s/scripts/              Strimzi + Flink operator install, secrets,
 │   │                             smoke test, watch-scaling, replica keeper
 │   └── observability/            alert rules, scrape config, dashboard
-├── .github/workflows/ci.yml      lint, Spark tests, Flink tests, Airflow tests, schema gate
+├── .github/workflows/ci.yml      lint + unit + Flink tests, Airflow tests, schema gate
 ├── secrets/                      git-ignored; `make secrets`
 └── docs/
 ```
@@ -285,7 +304,7 @@ because the producer keys Kafka messages by `source_ip` (one source = one
 partition = one source subtask) and parsing runs chained to the source, so
 each source's events reach the keyed operator through a single path. A late
 event is scored as of the newest time seen; nothing is dropped for being
-late (the Spark path drops events older than its 10-minute watermark).
+late (a micro-batch engine with a watermark would drop them).
 
 ### State per source
 
@@ -364,7 +383,7 @@ the table 31% smaller. `make ch-bench` re-runs the workload.
 | Flink Kubernetes Operator | 1.16.1 | job lifecycle, HA, job autoscaler |
 | Schema registry | Karapace 6.2.3 | Confluent-API-compatible, a quarter of cp-schema-registry's image size |
 | ClickHouse | 25.8.33 | LTS line |
-| Spark | 3.5.9, Scala 2.12, Java 17 | the replay path |
+| LightGBM | 4.7.0 | the model: trained in Airflow, scored compiled (no library) in Flink |
 | k3s (via k3d 5.9.0) | 1.36.4 | lightest local control plane |
 | Prometheus / Grafana | 3.14.0 / 13.2.2 | |
 | Airflow | 3.3.2 (slim image, Python 3.12) | orchestration; installed against its own constraints file |
@@ -375,9 +394,8 @@ the table 31% smaller. `make ch-bench` re-runs the workload.
 - **`docker/flink`** — Flink + PyFlink without the 298 MB
   `apache-flink-libraries` duplicate of `/opt/flink`, the Kafka connector,
   the shared `libpython` thread mode embeds, and the code. ~3 GB (Beam,
-  PyArrow, pandas come with PyFlink). `test` stage adds pytest.
-- **`docker/spark`** — `base` / `test` / `runtime`; the Spark path and the
-  main test suite.
+  PyArrow, pandas come with PyFlink). `test` stage adds pytest, ruff and
+  LightGBM: every unit test, the job's tests, and lint run here.
 - **`docker/producer`** — the simulator.
 - **`docker/airflow`** — Airflow slim + the postgres provider, the Kafka
   client for the evaluator, and the DAGs; `test` stage adds pytest.
@@ -398,7 +416,7 @@ staging; 24 / 12 / 6 in prod.
 make secrets && make dev-up                    # Kafka, registry, ClickHouse, Flink
 docker compose --profile sim up -d producer    # 1,000 events/s
 make latency                                   # end-to-end p50/p95/p99, last minute
-make test                                      # Spark, Flink and Airflow suites
+make test                                      # unit + Flink job + Airflow suites
 make airflow-up                                # + Airflow on :8080, producer at 100/s
 make cluster-up && make deploy ENV=staging     # k3d: Strimzi + Flink operator
 ```
@@ -433,8 +451,9 @@ Verified by running, not just written.
   real false positives — busy remote VPN hosts whose ordinary failed logins
   reach 20 in 5 minutes, so their next success trips
   `login_after_brute_force`
-- Earlier, on the Spark path over ~33,000 events: 98.9% of attack events
-  blocked; the parity test holds both engines to identical decisions
+- The ML layer (LightGBM in the stream, Groq review, daily retraining) is
+  built and tested; its first live measurements are in
+  [`orchestration.md`](orchestration.md) §5
 
 **Storage and queries**
 - New `security_events` layout: analyst drill-downs 20–600x less data read
@@ -449,11 +468,12 @@ Verified by running, not just written.
   attacks, 1.02 s median first flag); ~0.5 GB with a task running
 
 **Engineering**
-- Tests: 194 in the Spark image (unit, parity, 11 streaming-replay) plus 28
-  orchestration ops tests, 27 in the Flink image (the real job on a local
-  Flink mini-cluster, both execution modes), 42 in the Airflow image (ops,
-  evaluator, DAG structure); lint clean
-- Metrics, 19 alert rules, a Grafana dashboard with a streaming-path row and
+- Tests: 83 in the Flink image (engine-free unit tests, the compiled model
+  against LightGBM and within its time budget, and the real job on a local
+  Flink mini-cluster), 113 in the Airflow image (ops, training, the gate
+  and shadow check, the paginated reviewer, evaluator, DAG structure);
+  lint clean
+- Metrics, 8 alert rules (the 11 Spark ones went with Spark), a Grafana dashboard with a streaming-path row and
   a between-step data-quality panel
 - Secrets as mounted files; CI workflow for lint, both test suites, the
   schema gate and manifests
@@ -491,14 +511,17 @@ Docker VM. Whether Strimzi accepts Cruise Control with a single broker
 linear scaling across TaskManagers is expected (state is partitioned by
 source) but was only measured up to two, on one machine.
 
-**No LLM on the live path.** Rules decide alone in Flink; the Groq grey-zone
-judgement exists only on the Spark path, and has never made a live API call
-(no key has been set).
+**The model learns the simulator.** Its labels are the producer's ground
+truth plus the reviewer's corrections; on real traffic, until analysts'
+verdicts become labels, it can only be as good as the reviewer. That is
+why it may alert but not block on its own.
 
-**Dedup horizon changed on the live path.** Flink remembers a source's last
-1,024 event ids (~10 minutes for an ordinary host, ~25 s for one sending
-40 events/s); Spark remembers 10 minutes. Producer-retry duplicates arrive
-within seconds, so both catch them.
+**The reviewer has never made a live call** — no Groq key is set
+(`secrets/groq_api_key`); the review DAG skips until one is.
+
+**Dedup horizon.** Flink remembers a source's last 1,024 event ids (~10
+minutes for an ordinary host, ~25 s for one sending 40 events/s).
+Producer-retry duplicates arrive within seconds, so it catches them.
 
 **`unique_source_ips_5m` is always 0.** Features are keyed by source IP;
 credential stuffing (one account from many IPs) needs a user-keyed pass.
@@ -528,10 +551,9 @@ component not yet run on a cluster ([`orchestration.md`](orchestration.md) §6).
    verify the Flink autoscaler and broker HPA under `make load`
 2. Measure 10,000 events/s on real nodes (5 TaskManagers) and confirm
    latency stays under 200 ms
-3. Bring the LLM to the live path with an asynchronous operator: rule-
-   decided rows unchanged, grey-zone rows updated when the verdict arrives
+3. Set a Groq key; measure the reviewer's cost and how often it is right
 4. A user-keyed feature pass for credential stuffing; review
    `login_after_brute_force` for remote staff (7 false positives, above)
-5. Set a Groq key and measure LLM cost and quality on the grey zone
-6. Orchestrate Spark replays from Airflow, and send Airflow failures
-   somewhere a person sees them
+5. Replays: a bounded run of the Flink job over a Kafka time range,
+   launched from Airflow; send Airflow failures somewhere a person sees them
+6. Analysts' verdicts as labels, so the model learns real traffic

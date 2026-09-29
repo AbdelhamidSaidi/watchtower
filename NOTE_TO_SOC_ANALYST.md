@@ -20,10 +20,10 @@ If you read an earlier copy, these are the differences that affect you:
 
 | | before | now |
 |---|---|---|
-| **engine** | Spark, micro-batches | **Flink, one event at a time** (Spark kept for replays) |
+| **engine** | Spark, micro-batches | **Flink, one event at a time** (Spark removed) |
 | **time to a decision** | ~5–25 s (a batch every 20 s) | **~5 ms** after the event reaches Kafka |
 | **time until the row is queryable** | ~15 s typical | **~0.2 s** (median 194 ms, p95 346 ms at 1,000 events/s) |
-| **who decides** | rules, then the LLM for the grey zone | **rules alone** on the live path (the LLM runs only on the Spark replay path, §2) |
+| **who decides** | rules, then the LLM for the grey zone | **rules + a LightGBM model**, both in the stream; the LLM now **reviews** allowed events hourly and teaches the model (§2) |
 | **duplicate memory** | 10 minutes | a source's **last 1,024 events** (§5) |
 | **late events** | dropped if > 10 min late | **always scored** |
 | **new reject reasons** | — | `invalid_event_id`, `sink_parse_error` (§6) |
@@ -31,10 +31,9 @@ If you read an earlier copy, these are the differences that affect you:
 | **alerts** | `DetectionOutage`, `DetectionDisabled`, `RejectedEventsPresent` | live path: `StreamJobDown`, `StreamFallingBehind`, `StreamLatencyHigh`, `StreamRejectingEvents` (§4) |
 | **morning review** | query `security_events` | **`daily_top_sources`, `daily_rule_hits`, `daily_summary`**, built by Airflow each night (§4) |
 | **detection measured** | once, on the Spark path | **on the live path**, every 6 hours, kept in `detection_quality` (§1) |
+| **columns** | `llm_score`, `llm_reason`, `llm_model` | **`ml_score`, `ml_reason`, `ml_model`** (renamed; §1) |
 
-The rules, their scores and the thresholds are **unchanged**, and the live
-path computes exactly what the Spark path computes — a test feeds the same
-traffic through both and requires identical rows.
+The rules, their scores and the thresholds are **unchanged**.
 
 ---
 
@@ -113,15 +112,18 @@ no API key.
 |---|---|
 | `rule_score`, `final_anomaly_score` | the highest-scoring rule that fired (0 if none) |
 | `rule_hits` | every rule that fired, strongest first |
-| `llm_score`, `llm_model` | always `0` / empty |
-| `llm_reason` | `skipped:rule_decided` (blocked by rules) or `detection_disabled:streaming_rules_only` (not blocked; no LLM second opinion) |
+| `ml_score` | the model's probability that this is an attack (0 if no model is active) |
+| `ml_model` | the model version that scored it (`watchtower.ml_models`) |
+| `ml_reason` | set only when the model **raised** the decision above what the rules said: `ml: <the features that drove it>`, e.g. `ml: failed_logins_5m, unique_users_5m` |
+| `final_anomaly_score` | the higher of the rule score and the model's |
 
-So on the live path an event the rules do not settle is **allowed**. There
-is no grey-zone judgement yet (§5).
+**The model alone can alert, never block.** To block, a rule must agree:
+a block you cannot explain in rule terms is one you cannot defend. (Set
+`WATCHTOWER_ML_CAN_BLOCK=true` once the model has earned it.)
 
 ### Measured (synthetic company traffic)
 
-On ~33,000 labelled events (Spark path, same rules):
+Earlier, on ~33,000 labelled events (Spark path, the same rules):
 
 | scenario | blocked | how |
 |---|---|---|
@@ -170,7 +172,7 @@ rules have no such gap: the first SQL injection is blocked.
 live path, 290 of the 297 came from the four workstations running
 lateral-movement or exfiltration attacks -- their own background traffic,
 during the attack or in the 5 minutes after, while their windows still
-held the evidence. (On the Spark path, all 90 of the 0.32% were the same
+held the evidence. (On the earlier Spark run, all 90 of the 0.32% were the same
 kind.)
 Behavioural rules key on the SOURCE, so a host that is exfiltrating gets
 **all** its traffic blocked for the window. That is containment, and
@@ -191,49 +193,58 @@ a per-user count, for remote hosts.
 ## 2. How a score is produced
 
 ```
-   every event
+   every event (Flink, in the stream)
         |
-   RULES              deterministic, no API call  -> rule_score, rule_hits
+   RULES          deterministic                  -> rule_score, rule_hits
         |
-   +----+----------------------------------------+
-   |                                             |
- live path (Flink)                         replay path (Spark)
-   |                                             |
- final = rule score                  rule score >= 0.85 -> decided
-                                     otherwise -> TRIAGE GATE -> LLM (Groq)
-                                     final = max(rule score, LLM score)
+   MODEL          LightGBM, ~5 us                -> ml_score, ml_model
+        |
+   final = max(rule score, model score)   -- the model alone stops at `alert`
+        |
+   allow / alert / block, stored in security_events
+
+   every hour (Airflow, offline)
+   a sample of ALLOWED events --> LLM (Groq) --> event_reviews
+        confident disagreements --> training labels --> daily retraining
+        --> the new model goes live only if it beats the current one
 ```
 
-**Why the live path has no LLM.** A remote API call per undecided event
-would hold up that source's stream while the call is in flight -- the
-opposite of deciding each event as it arrives. Bringing the LLM back needs
-an asynchronous step: rule decisions go out immediately, and an LLM verdict
-updates the row when it arrives. That is on the roadmap, not built.
+**Why the LLM does not score live.** A remote API call per event would
+hold up that source's stream -- the opposite of deciding each event as it
+arrives. So the LLM became the **reviewer**: it re-judges a sample of what
+the pipeline let through, and teaches the model what it missed.
 
-### The LLM on the replay path
+### What the reviewer looks at
 
-Verdicts come from Groq, not a fitted model; nothing is trained. Because
-one call per event is impossible at volume, events pass a **triage gate**
-first, and verdicts are cached by behaviour signature for 60 seconds.
-Measured on 59,300 labelled events (v1 traffic):
+Not everything -- 3.6 million events an hour at 1,000/s -- but up to 150
+an hour (3,000 a day):
+- **near-misses:** the highest model scores that were still allowed
+- **unusual:** the hour's top 0.1% on a behaviour feature
+- **random:** a uniform sample, which is what tells you the real miss rate
+- **the model's own alerts** (no rule behind them): where the AI calls one
+  benign, the model learns to be quieter
 
-| | events | reach the LLM |
-|---|---|---|
-| benign traffic | 55,724 | **0.1%** |
-| ssh brute force | 1,700 | 98.7% |
-| password spray | 805 | 98.5% |
-| lateral movement | 849 | 96.3% |
-| **all attacks** | 3,576 | **92.7%** (recall ceiling) |
+New labels start a retraining at once; a new model goes live only if it
+measures better, and is rolled back automatically if the AI calls most of
+its own alerts benign.
 
-The LLM sees one sentence per candidate, not log lines:
+Each gets a verdict (benign / suspicious / malicious), a confidence and a
+reason, in `watchtower.event_reviews`. The ones that matter to you:
 
+```sql
+-- allowed events the reviewer disagreed with, newest first
+SELECT reviewed_at, source_ip, event_type, verdict, confidence, reason, why_selected
+FROM watchtower.label_changes ORDER BY reviewed_at DESC LIMIT 50;
 ```
-external IP 45.134.26.7, night: 40 events/min, 38 failed logins/min,
-180 failed logins/5min, 1 distinct accounts, 0 port scans, ...
-```
 
-`llm_reason` is the model's own justification. Treat it as a hypothesis to
-check, not a finding.
+If it is **≥ 90% sure an allowed event was malicious**, the Airflow run
+fails at once (`watchtower_review`) -- treat that as an alert. At ≥ 80%, a
+disagreement becomes a training label, weighted at half of ground truth.
+
+**The reviewer's reason is a hypothesis, not a finding.** It is an LLM:
+confident, and sometimes wrong. That is why its labels weigh less, and why
+a new model goes live only if it measures better on events the reviewer
+never judged.
 
 ---
 
@@ -244,7 +255,7 @@ they belong in the `pipeline-env` ConfigMap (deploy/k8s overlays); in dev,
 on the Flink containers in `docker-compose.yml`. **They take effect when the
 job restarts.**
 
-### Both paths
+### Thresholds
 
 | variable | default | meaning |
 |---|---|---|
@@ -254,33 +265,26 @@ job restarts.**
 These were not derived from your data. Work backwards from your capacity:
 the alert threshold should yield roughly the number of alerts your team can
 actually triage. The rule scores themselves (§1) live in
-`etl/core/rules.py` (live path) and `etl/detect/rules.py` (replay path),
-and a test requires the two to agree.
+`etl/core/rules.py`.
 
-### Live path only
+### The stream
 
 | variable | default | meaning |
 |---|---|---|
 | `WATCHTOWER_DEDUP_RECENT` | `1024` | how many recent event ids each source remembers for duplicate detection (§5) |
 | `WATCHTOWER_SOURCE_IDLE_MS` | 15 min | a source silent this long is forgotten: its windows restart from zero |
+| `WATCHTOWER_ML` | `on` | `off` scores with rules alone, whatever model is active |
+| `WATCHTOWER_ML_CAN_BLOCK` | `false` | let the model block on its own, without a rule agreeing |
 
-### Replay path only (the LLM)
+### The reviewer (Airflow)
 
 | variable | default | meaning |
 |---|---|---|
-| `TRIAGE_FAILED_1M` / `_5M` | 12 / 30 | failed logins that make an event an LLM candidate |
-| `TRIAGE_PORTS_5M` / `TRIAGE_SCANS_5M` | 6 / 4 | distinct ports / port-scan events |
-| `TRIAGE_USERS_5M` | 8 | distinct accounts |
-| `TRIAGE_REQUESTS_1M` | 900 | events per minute |
-| `GROQ_MODEL` | `llama-3.1-8b-instant` | pin it; a model change is a detector change |
-| `GROQ_VERDICT_TTL` | 60 s | how long a verdict is reused for matching behaviour |
-| `GROQ_BATCH_SIZE` / `GROQ_MIN_INTERVAL` | 25 / 0.5 s | candidates per call, gap between calls |
+| `GROQ_MODEL` | `openai/gpt-oss-safeguard-20b` | pin it; a model change changes what gets relabelled |
+| `GROQ_REASONING_EFFORT` | `medium` | how long it thinks per batch |
 
-Each triage default sits just above what that feature reaches on benign
-simulated traffic; guessed values once sent 46.9% of normal traffic to the
-API. **Re-measure them against your own traffic** -- they encode what this
-simulation's backup jobs and CI runners do, not what yours do. The v2
-triage signals have not been re-measured at all.
+The per-run and per-day caps (150 / 3,000) and the confidence bars (80% to
+become a label, 90% to alert) are in `orchestration/ops/review.py`.
 
 ---
 
@@ -350,31 +354,35 @@ hourly check also records the data's health in
 latency, unmerged copies, and whether the share of blocks jumped against
 the past week. Details: `docs/orchestration.md`.
 
-### If you run the replay path with the LLM
+### The model
 
-Set the key as a file (`secrets/groq_api_key`), never an exported variable
-in a shared shell. Without it the replay path still runs; rows carry
-`detection_disabled:no_api_key`.
-
-On that path detection **fails open**: an API error scores the event 0 and
-lets it through, so an outage looks like a quiet night. `DetectionOutage`
-fires when any event in the last 10 minutes passed unjudged;
-`DetectionDisabled` when there is no key. By hand:
+Which model is live, and how it measured:
 
 ```sql
-SELECT count() AS failures
-FROM watchtower.security_events
-WHERE timestamp > now() - INTERVAL 10 MINUTE
-  AND llm_reason LIKE 'llm_error%';
+SELECT a.activated_at, a.version, a.reason, m.trained_rows, m.metrics
+FROM watchtower.ml_model_active AS a JOIN watchtower.ml_models AS m USING (version)
+ORDER BY a.activated_at DESC LIMIT 5;
+```
+
+A model that is not better is registered but never promoted. To roll back,
+promote an earlier version (the stream picks it up within 5 minutes):
+
+```sql
+INSERT INTO watchtower.ml_model_active (version, reason)
+VALUES ('lgbm-...', 'rollback: <why>');
 ```
 
 ---
 
 ## 5. Known gaps — read before relying on this
 
-**No grey-zone judgement on the live path.** Whatever the rules do not
-settle is `allow`. The LLM exists only on the replay path, and has never
-made a live API call (no key has been set).
+**The model learns the simulator.** Its labels are the synthetic
+producer's ground truth plus the reviewer's corrections. On real traffic
+there is no ground truth: until **your verdicts** become labels, the model
+is only as good as the reviewer. It can alert on its own, never block.
+
+**The reviewer has never made a live call** -- no Groq key is set yet
+(`secrets/groq_api_key`). Until then the review is skipped.
 
 **Duplicate memory is 1,024 events per source on the live path.** A
 re-delivered event is recognised if it repeats one of its source's last
@@ -400,14 +408,14 @@ three. **This system catches noisy attacks. It does not catch slow ones.**
 **Behavioural rules block the whole source** while it misbehaves (§1) --
 containment, and a policy choice for you to confirm.
 
-**No feedback loop.** Marking an alert as a false positive changes nothing.
-Improving detection means editing the rules or thresholds by hand.
+**The feedback loop is the reviewer's, not yet yours.** The model retrains
+on the LLM's corrections; marking an alert as a false positive yourself
+still changes nothing. Analysts' verdicts as labels is the next step.
 
-**On the replay path only:** the LLM depends on an external API, is not
-deterministic across model versions (pin `GROQ_MODEL`), and sends behaviour
-summaries -- including internal IP addresses, never log content, usernames
-or commands -- to a third party. Confirm that is acceptable under your data
-policy before running it on real traffic.
+**The reviewer sends event details to a third party (Groq):** source IPs,
+usernames, URL paths, commands and file paths of the events it reviews --
+up to 3,000 a day. Confirm that is acceptable under your data policy before
+setting the key on real traffic.
 
 **Privilege escalation -- closed.** 144 hostile commands in 5 minutes used
 to look the same as the CI runners' 1,762 routine ones. Commands are now
@@ -480,6 +488,5 @@ ORDER BY rejected_at DESC LIMIT 20;
 
 `StreamRejectingEvents` fires on any of these except `sink_parse_error`
 (which ClickHouse creates, after the job) -- check for that one by querying.
-On the replay path the equivalent alert is `RejectedEventsPresent`. **A
-sudden rise is itself worth investigating**: it can mean a broken log source, or something
+**A sudden rise is itself worth investigating**: it can mean a broken log source, or something
 deliberately malforming logs to avoid being parsed.

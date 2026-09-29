@@ -1,8 +1,0 @@
-# Test and lint tooling. Installed only into the `test` stage of
-# docker/spark/Dockerfile -- never shipped in the runtime image.
-
--r requirements.txt
-
-pytest==9.1.1
-ruff==0.16.8
-fastavro==1.12.2

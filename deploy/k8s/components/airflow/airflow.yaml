@@ -29,6 +29,8 @@ data:
   # hostnames do not resolve in the cluster; pod IPs do.
   AIRFLOW__CORE__HOSTNAME_CALLABLE: airflow.utils.net.get_host_ip_address
   CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+  # watchtower_review: the Groq reviewer's key (empty = no review).
+  GROQ_API_KEY_FILE: /run/secrets/groq_api_key
   # watchtower_pipeline: the stream job's REST API (the Flink operator's
   # service for FlinkDeployment `stream`), and restart a job that has
   # stopped for good by bumping that FlinkDeployment's restartNonce.
@@ -207,6 +209,8 @@ spec:
                 path: airflow_jwt_secret
               - key: airflow_admin_password
                 path: airflow_admin_password
+              - key: groq_api_key
+                path: groq_api_key
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -262,6 +266,8 @@ spec:
                 path: airflow_jwt_secret
               - key: airflow_admin_password
                 path: airflow_admin_password
+              - key: groq_api_key
+                path: groq_api_key
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -326,6 +332,8 @@ spec:
                 path: airflow_jwt_secret
               - key: airflow_admin_password
                 path: airflow_admin_password
+              - key: groq_api_key
+                path: groq_api_key
 ---
 apiVersion: v1
 kind: Service

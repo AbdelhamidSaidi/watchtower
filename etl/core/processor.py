@@ -6,19 +6,18 @@
     rules      deterministic detection (core/rules.py)
 
 One SourceState per source_ip. Storage is pluggable: plain Python here
-(tests, Spark), Flink keyed state in stream/job.py -- where every
+(tests), Flink keyed state in stream/job.py -- where every
 operation touches one state entry, so the per-event cost does not grow
 with the window.
 
 DEDUP HORIZON. In memory, an event_id is remembered for DEDUP_MS of the
-source's event time -- the same 10 minutes as Spark's watermark. In
+source's event time. In
 Flink, for the source's last 1,024 events (stream/job.RecentIds: a ring of
 id hashes inside the summary state, which costs no state call). What dedup
 guards against is Kafka producer retries, which come within seconds;
 Flink's own restarts replay nothing twice, since windows and offsets are
-restored from the same checkpoint. Unlike Spark, nothing is dropped for being late: Spark
-discards an event older than the global watermark outright, a detection
-gap; here a late event is still scored (as of the newest time seen, see
+restored from the same checkpoint. Nothing is dropped for being late: a
+late event is still scored (as of the newest time seen, see
 RollingWindow).
 """
 
@@ -28,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.columns import EVENT_COLUMNS, SCORE_COLUMNS
 from core.records import clickhouse_time
+from core import ml
 from core.rules import score_event
 from core.window import RollingWindow, record_of
 
@@ -67,9 +67,12 @@ class SourceState:
     """One source_ip's window plus the event_ids it sent recently. Storage
     is pluggable: in memory here, Flink keyed state in the job."""
 
-    def __init__(self, window_store=None, seen=None):
+    def __init__(self, window_store=None, seen=None, model=None):
         self.window = RollingWindow(window_store)
         self.seen = seen if seen is not None else MemorySeen()
+        # A core.ml.Model, or None for rules alone. The job swaps it when a
+        # new model is promoted.
+        self.model = model
 
     def process(self, event):
         """Features + rules for one normalized, enriched event.
@@ -80,11 +83,12 @@ class SourceState:
         if event_id in self.seen:
             return None
         ts = event["_ts"]
-        ts_ms = (ts - _EPOCH) // _MS  # exact floor, like Spark's ns // 1e6
+        ts_ms = (ts - _EPOCH) // _MS  # exact floor
         self.seen.remember(event_id, ts_ms)
 
         event.update(self.window.add(record_of(event, ts_ms)))
         score_event(event)
+        ml.apply(event, self.model)
 
         row = {name: event.get(name) for name in OUTPUT_COLUMNS}
         row["event_id"] = event_id

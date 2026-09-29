@@ -8,9 +8,9 @@ Watchtower streaming job: every event decided the moment it arrives.
       -> dedup + rolling features + rules  (per event, keyed state)
       -> Kafka security-events-scored -> ClickHouse Kafka engine -> security_events
 
-NO MICRO-BATCHES. The Spark pipeline collected events for a trigger
-interval and processed them together, so an event waited up to a whole
-interval before anything looked at it. Here each event goes through the
+NO MICRO-BATCHES. A micro-batch engine collects events for a trigger
+interval and processes them together, so an event waits up to a whole
+interval before anything looks at it. Here each event goes through the
 job on its own; what remains are small, bounded buffers, each set here or
 in config.py:
 
@@ -18,8 +18,8 @@ in config.py:
     JVM -> Python        PYTHON_BUNDLE_MS   (Flink default 1,000 ms)
     ClickHouse inserts   kafka_flush_interval_ms in 03_streaming_ingest.sql
 
-The logic is etl/core -- the same functions tests/unit/test_parity.py
-proves equal to the Spark path.
+The logic is etl/core, tested without a cluster (tests/unit); this file
+wires it into Flink operators (tests/flink runs them on a mini-cluster).
 
 DELIVERY. At-least-once end to end: Kafka offsets are checkpointed with
 the keyed state, the Kafka sink flushes on every checkpoint, and
@@ -33,8 +33,10 @@ inserts in blocks, not per event. Its Kafka engine does that batching on
 its side, commits only what it inserted, and keeps a ClickHouse outage
 from back-pressuring detection.
 
-LLM. Not on this path: a remote call per grey-zone event would stall its
-source's stream. Rules decide in-stream (see core/rules.py).
+DETECTION. Rules (core/rules.py) and a LightGBM model (core/ml.py),
+both in-stream: the model is compiled to plain Python and costs ~5 us per
+event (tools/bench_model.py). It is trained offline by Airflow and picked
+up from ClickHouse without a restart (stream/models.py).
 
 Run: the image's entrypoint does it (docker-compose.yml, or the
 FlinkDeployment in deploy/k8s). Locally:
@@ -75,6 +77,7 @@ from core.latency import LatencyWindow  # noqa: E402
 from core.processor import SourceState  # noqa: E402
 from core.records import Decoder, enrich, normalize, reject_reason, rejected_row  # noqa: E402
 from core.window import new_summary  # noqa: E402
+from stream.models import ModelSource  # noqa: E402
 
 REJECTED = OutputTag("rejected", Types.STRING())
 
@@ -410,6 +413,7 @@ class DetectPerSource(KeyedProcessFunction):
         # redelivery and job replays, which happen within minutes of the
         # original, whatever the event's own timestamp says.
         self.source = SourceState(self.store, RecentIds(self.store))
+        self.models = ModelSource()
 
         group = runtime_context.get_metrics_group().add_group("watchtower")
         self.scored = BatchedCounter(group, "scored_events")
@@ -417,7 +421,10 @@ class DetectPerSource(KeyedProcessFunction):
         self.forgotten = BatchedCounter(group, "idle_sources_cleared")
         self.actions = {a: BatchedCounter(group, f"action_{a}") for a in ("allow", "alert", "block")}
         self.dq = IssueCounters(group, ("features", "rules"))
-        self.counters = [self.scored, self.duplicates, self.forgotten, *self.actions.values(), self.dq]
+        # Events whose decision the model raised above what the rules said.
+        self.ml_raised = BatchedCounter(group, "ml_raised")
+        self.counters = [self.scored, self.duplicates, self.forgotten, *self.actions.values(), self.dq,
+                         self.ml_raised]
         # Two latencies, as rolling p50/p95/max over the last 2,000 events:
         #   event_age      event timestamp -> scored: includes the source's
         #                  own delay before Kafka (producer clock vs ours --
@@ -446,6 +453,7 @@ class DetectPerSource(KeyedProcessFunction):
 
     def process_element(self, event, ctx):
         self.store.load()
+        self.source.model = self.models.refresh(int(time.time() * 1000))
         row = self.source.process(event)
         if row is None:
             self.duplicates.inc()
@@ -465,6 +473,8 @@ class DetectPerSource(KeyedProcessFunction):
         self.store.save()
         self.scored.inc()
         self.actions[row["recommended_action"]].inc()
+        if row["ml_reason"]:
+            self.ml_raised.inc()
         self.dq.count("features", dq.after_features(row))
         self.dq.count("rules", dq.after_rules(row))
         now_ms = int(time.time() * 1000)

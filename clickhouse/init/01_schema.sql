@@ -39,17 +39,19 @@ CREATE TABLE IF NOT EXISTS watchtower.security_events
     is_night                UInt8   DEFAULT 0,
 
     -- ---- detection ------------------------------------------------------
-    -- Verdicts come from an LLM (Groq). llm_reason is the model's own
-    -- justification for the score, stored so an alert can be explained
-    -- without re-running anything.
-    -- Rules settle what is unambiguous; the LLM judges the grey zone.
-    -- final_anomaly_score = max(rule_score, llm_score).
+    -- Rules settle what is unambiguous; a LightGBM model (etl/core/ml.py),
+    -- scored on the same features in the same pass, judges the rest.
+    -- ml_reason names the features that drove a model score that mattered,
+    -- so an alert can be explained without re-running anything; ml_model
+    -- is the model version (watchtower.ml_models).
+    -- final_anomaly_score = max(rule_score, ml_score), the model's share
+    -- capped below `block` unless a rule agrees (WATCHTOWER_ML_CAN_BLOCK).
     rule_score              Float32 DEFAULT 0,
     rule_hits               LowCardinality(String) DEFAULT '',
     recommended_action      LowCardinality(String) DEFAULT 'allow',
-    llm_score               Float32 DEFAULT 0,
-    llm_reason              String  DEFAULT '',
-    llm_model               LowCardinality(String) DEFAULT '',
+    ml_score                Float32 DEFAULT 0,
+    ml_reason               String  DEFAULT '',
+    ml_model                LowCardinality(String) DEFAULT '',
     final_anomaly_score     Float32 DEFAULT 0,
     is_suspicious           UInt8   DEFAULT 0,
 
@@ -135,8 +137,8 @@ CREATE TABLE IF NOT EXISTS watchtower.suspicious_events
     recommended_action      LowCardinality(String),
     rule_hits               String,
     rule_score              Float32,
-    llm_score               Float32,
-    llm_reason              String,
+    ml_score                Float32,
+    ml_reason               String,
     final_anomaly_score     Float32,
     url_path                String,
     user_agent              String,

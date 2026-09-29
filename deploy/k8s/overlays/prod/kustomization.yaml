@@ -17,25 +17,6 @@ resources:
 components:
   - ../../components/airflow
 
-configMapGenerator:
-  - name: pipeline-env
-    behavior: merge
-    literals:
-      - SPARK_EXECUTORS=auto
-      - SPARK_MIN_EXECUTORS=2
-      - SPARK_MAX_EXECUTORS=8
-      - SPARK_EXECUTOR_MEMORY=1g
-      - SPARK_EXECUTOR_MEMORY_OVERHEAD=768m
-      - SPARK_EXECUTOR_CORES=2
-      - SPARK_EXECUTOR_REQUEST_CORES=1000m
-      - SPARK_DRIVER_MEMORY=1g
-      # 8 executors x 2 cores = 16 slots: a batch needs at least 16 tasks
-      # for the top of the range to be used at all.
-      - KAFKA_MIN_PARTITIONS=16
-      - WATCHTOWER_SHUFFLE_PARTITIONS=16
-      - WATCHTOWER_ROCKSDB_MEMORY_MB=384
-      - WATCHTOWER_TRIGGER=10 seconds
-
 patches:
   - target: {kind: KafkaNodePool, name: controllers}
     patch: |-

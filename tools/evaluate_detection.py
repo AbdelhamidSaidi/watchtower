@@ -10,6 +10,8 @@ reports:
   - precision: of what was blocked or flagged, how much was an attack
   - false positives, split into CONTAINMENT (a compromised host's ordinary
     traffic, blocked along with its attack) and uninvolved hosts
+  - the ML model's own alerts (flagged with no rule behind them): how many
+    were attacks
   - per attack (one scenario from one source, split on a 60 s pause):
     whether it was caught, and how long it ran before the first alert --
     the number a per-event live path exists for
@@ -266,6 +268,9 @@ def summarize(truth, undecodable, decided, refused, since_ms, minutes):
     a, n = sum(attack.values()), sum(normal.values())
     blocked = attack["block"] + normal["block"]
     flagged = blocked + attack["alert"] + normal["alert"]
+    # Flagged with no rule behind them: the ML model's decision alone.
+    model_only = [s for s, action, hits, _, _ in joined if action != "allow" and not hits]
+    model_only_attacks = sum(1 for s in model_only if s != "normal")
     timed = [x["first_flag_s"] for x in found if x["first_flag_events"] is not None
              and not x["started_before_window"] and not x["known_source"]]
     total = len(truth) + undecodable
@@ -296,6 +301,9 @@ def summarize(truth, undecodable, decided, refused, since_ms, minutes):
             "attacks_caught": sum(1 for x in found if x["first_flag_events"] is not None),
             "median_time_to_flag_s": statistics.median(timed) if timed else None,
             "coverage": ratio(len(joined), total),
+            "model_only_flags": len(model_only),
+            "model_only_attacks": model_only_attacks,
+            "model_only_precision": ratio(model_only_attacks, len(model_only)),
         },
     }
 
@@ -336,6 +344,8 @@ def print_report(r):
     print(f"precision of block (attack share)    : {pct(s['precision_block'])}"
           f"   counting containment: {pct(s['precision_block_with_containment'])}")
     print(f"precision of block+alert             : {pct(s['precision_flag'])}")
+    print(f"flagged by the ML model alone        : {s['model_only_flags']}, of which attacks "
+          f"{s['model_only_attacks']} ({pct(s['model_only_precision'])})")
 
     if r["attacks"]:
         print(f"\n{'attack':<22}{'source':<16}{'events':>7}{'flagged':>9}   first flag after")

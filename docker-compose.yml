@@ -1,14 +1,14 @@
 # Watchtower DEV stack -- the fast inner loop on one machine.
 #
-#   producer -> kafka -> pipeline (spark, local mode) -> clickhouse
-#                  \-> schema-registry (karapace)
+#   producer -> kafka -> Flink (per event) -> kafka -> clickhouse
+#                  \-> schema-registry (karapace)          ^ airflow watches it all
 #
 # Kubernetes (deploy/k8s) is the scalable deployment. This file exists so a
 # code change can be tried in seconds: ./etl and ./schemas are mounted over
-# the image, so edits need a pipeline restart, not a rebuild.
+# the image, so edits need a job restart, not a rebuild.
 #
 # Versions match the Kubernetes deployment exactly (Kafka 4.3.1, the same
-# Spark image), so "works in dev" means something in staging.
+# Flink image), so "works in dev" means something in staging.
 #
 #   make secrets     once, before first start
 #   make dev-up      start everything
@@ -18,6 +18,9 @@
 services:
   kafka:
     image: apache/kafka:4.3.1
+    # Back on its own after a crash or a memory kill: the pipeline's data
+    # path must not wait for someone to notice.
+    restart: unless-stopped
     container_name: watchtower-kafka
     ports:
       - "9092:9092"
@@ -81,6 +84,9 @@ services:
   # 563 MB vs 2,180 MB compressed -- with no change to any client code.
   schema-registry:
     image: ghcr.io/aiven-open/karapace:6.2.3
+    # Back on its own after a crash or a memory kill: the pipeline's data
+    # path must not wait for someone to notice.
+    restart: unless-stopped
     container_name: watchtower-schema-registry
     depends_on:
       kafka-init:
@@ -112,7 +118,8 @@ services:
 
   # One-shot: the only path by which a schema reaches the registry.
   schema-init:
-    image: watchtower/spark:3.5.9
+    # The producer image: Python + fastavro, and the same schemas/ code.
+    image: watchtower/producer:1.0
     depends_on:
       schema-registry:
         condition: service_healthy
@@ -124,6 +131,9 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:25.8.33
+    # Back on its own after a crash or a memory kill: the pipeline's data
+    # path must not wait for someone to notice.
+    restart: unless-stopped
     container_name: watchtower-clickhouse
     ports:
       - "8123:8123"   # HTTP  (clickhouse-connect, curl, UI)
@@ -192,6 +202,11 @@ services:
       WATCHTOWER_PYTHON_EXECUTION_MODE: ${WATCHTOWER_PYTHON_EXECUTION_MODE:-thread}
       WATCHTOWER_PYTHON_BUNDLE_MS: ${WATCHTOWER_PYTHON_BUNDLE_MS:-5}
       WATCHTOWER_CHECKPOINT_INTERVAL_MS: ${WATCHTOWER_CHECKPOINT_INTERVAL_MS:-10000}
+      # The active ML model is read from ClickHouse (etl/stream/models.py);
+      # WATCHTOWER_ML=off scores with rules alone.
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
+      WATCHTOWER_ML: ${WATCHTOWER_ML:-on}
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.memory.process.size: 640m
@@ -210,6 +225,8 @@ services:
     ports:
       - "8082:8081"   # Flink UI
       - "9249:9249"   # /metrics (JobManager)
+    secrets:
+      - clickhouse_password
     volumes:
       - ./etl:/opt/watchtower/etl:ro
       - ./schemas:/opt/watchtower/schemas:ro
@@ -223,62 +240,14 @@ services:
       - flink-jobmanager
     command: ["taskmanager"]
     environment: *flink-env
+    secrets:
+      - clickhouse_password
     ports:
       - "9250-9257:9249"   # /metrics, one host port per TaskManager (9250 = the first)
     volumes:
       - ./etl:/opt/watchtower/etl:ro
       - ./schemas:/opt/watchtower/schemas:ro
       - flink-checkpoints:/var/lib/watchtower/flink-checkpoints
-    restart: unless-stopped
-
-  # --- the micro-batch path: Spark. Replays and backfills; not run by default.
-  #     docker compose --profile spark up pipeline
-  pipeline:
-    profiles: [spark]
-    build:
-      context: .
-      dockerfile: docker/spark/Dockerfile
-      target: runtime
-    image: watchtower/spark:3.5.9
-    container_name: watchtower-pipeline
-    depends_on:
-      schema-init:
-        condition: service_completed_successfully
-      clickhouse:
-        condition: service_healthy
-    # Sized for 1,000 events/sec: 20,000 rows per 20 s batch. 4 cores and 8
-    # shuffle partitions spread ~1,780 source IPs across the stateful stage.
-    command:
-      - /opt/spark/bin/spark-submit
-      - --master=local[4]
-      - --driver-memory=1536m
-      - /opt/watchtower/etl/pipeline.py
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      CLICKHOUSE_HOST: clickhouse
-      # Secrets as files: config.read_secret() reads *_FILE first.
-      CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
-      GROQ_API_KEY_FILE: /run/secrets/groq_api_key
-      WATCHTOWER_TRIGGER: 20 seconds
-      WATCHTOWER_SHUFFLE_PARTITIONS: 8
-      # 3x one trigger's worth at 1,000/sec, so a slow batch is caught up
-      # instead of the pipeline trailing by exactly its own capacity forever.
-      KAFKA_MAX_OFFSETS_PER_TRIGGER: 60000
-    secrets:
-      - clickhouse_password
-      - groq_api_key
-    ports:
-      - "9108:9108"   # /metrics
-      - "4040:4040"   # Spark UI
-    volumes:
-      # Dev: the working tree, mounted over the code baked into the image.
-      - ./etl:/opt/watchtower/etl:ro
-      - ./schemas:/opt/watchtower/schemas:ro
-      # Durable checkpoints: offsets + state survive a container restart.
-      - checkpoints:/var/lib/watchtower/checkpoints
-    # A dead query makes the driver exit; this restarts it, and it resumes
-    # from the checkpoint above. Restart + durable checkpoint = recovery.
     restart: unless-stopped
 
   producer:
@@ -351,17 +320,20 @@ services:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PASSWORD_FILE: /run/secrets/clickhouse_password
       FLINK_REST_URL: http://flink-jobmanager:8081
+      GROQ_API_KEY_FILE: /run/secrets/groq_api_key
       WATCHTOWER_SYNTHETIC_TRAFFIC: "true"
     secrets:
       - clickhouse_password
       - airflow_db_password
       - airflow_jwt_secret
       - airflow_admin_password
+      - groq_api_key
     volumes:
       # Edit a DAG or its ops and the change is live within a minute, no
       # rebuild. The image carries the same files for Kubernetes.
       - ./orchestration:/opt/watchtower/orchestration:ro
       - ./tools/evaluate_detection.py:/opt/watchtower/tools/evaluate_detection.py:ro
+      - ./etl/core:/opt/watchtower/etl/core:ro
       - airflow-logs:/opt/airflow/logs
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v2/monitor/health"]
@@ -386,7 +358,6 @@ secrets:
 volumes:
   kafka-data:
   clickhouse-data:
-  checkpoints:
   flink-checkpoints:
   airflow-db:
   airflow-logs:

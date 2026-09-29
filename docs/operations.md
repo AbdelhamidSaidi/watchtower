@@ -18,9 +18,8 @@ latency, [`streaming.md`](streaming.md). For tuning detection, see
 | **staging** | k3d (Kubernetes) | 1 controller + 1–2 brokers (autoscaled) | 1–3 TaskManagers (autoscaled) | production-shaped traffic, the promotion gate |
 | **prod** | k3d (Kubernetes) | 3 controllers + 3–6 brokers (autoscaled), RF 3 | 5–24 TaskManagers (autoscaled; 5 = 10,000 events/s) | the real shape |
 
-The Spark pipeline is no longer the live path; it remains for replays and
-backfills (`docker compose --profile spark up pipeline`, or the
-`components/spark-pipeline` Kustomize component).
+Flink is the only engine: the Spark pipeline that preceded it was removed
+on 2026-09-28.
 
 All three run the **same image** and the **same Kafka version (4.3.1)**. They
 differ only in configuration, so a change that works in staging fails in
@@ -58,14 +57,19 @@ make latency        # end-to-end p50/p95/p99 over the last minute
 `http://localhost:8082` — Flink UI (job graph, per-operator busy time)
 `http://localhost:9250/metrics` — the job's metrics (TaskManager)
 
-An existing ClickHouse volume needs `make ch-migrate` once, for the
-streaming ingest tables (`03_streaming_ingest.sql`).
+An existing ClickHouse volume needs the migrations once, then the Kafka
+intake recreated (its columns cannot be altered):
 
-Detection is disabled until you add a Groq key:
+```bash
+make ch-migrate && make ch-recreate-ingest
+```
+
+Detection needs no key: rules and the model run in the stream. The hourly
+LLM review (Airflow, `watchtower_review`) is skipped until you add a Groq
+key; Airflow reads it on the next run:
 
 ```bash
 printf '%s' 'gsk_...' > secrets/groq_api_key
-docker compose restart pipeline
 ```
 
 ---
@@ -73,31 +77,27 @@ docker compose restart pipeline
 ## 3. Tests and CI
 
 ```bash
-make test-unit      # 136 tests, ~25s
-make test           # + 11 streaming-replay tests, ~4 min
-make test-airflow   # DAGs parse and are wired as documented; ops; evaluator
+make test-unit      # engine-free unit tests, seconds
+make test-flink     # + the job on a local Flink mini-cluster
+make test           # test-flink + test-airflow: every suite
+make test-airflow   # DAGs parse and are wired as documented; ops, training, reviewer
 make ci             # lint + tests + render both overlays
 make evaluate       # detection vs ground truth, per attack type (dev)
 ```
 
-Tests run **inside the test stage of the Spark image**, so they see the same
-jars, Python and pyspark as production. There is no "works on my machine"
-gap between the test run and the pipeline.
+Tests run **inside the test stage of the Flink image** (unit, the job, lint)
+and of the Airflow image (the DAGs and their ops), so they see the same
+Python and libraries as production.
 
 | suite | what it proves |
 |---|---|
-| `test_parse` | Avro decode, and every wire failure gets its own reason. A v2 schema does not strand v1 messages |
-| `test_clean` | each invalid field → a distinct `reject_reason`; the timestamp cast |
-| `test_features` | rolling counters, event-time ordering, eviction after 5 min, state across batches |
-| `test_deduplicate` | replays dropped, keyed on `event_id` alone |
-| `test_llm_detector` | triage, caching, batching, and every fail-open path — including that an API error is **not** cached |
-| `test_config` | secrets resolve from files first and are never printed |
-| `test_metrics` | progress events → gauges; free-text reasons → bounded labels |
-| `integration/` | a fixed event set through the whole streaming chain. The burst spans two micro-batches and duplicates arrive a batch late, so **cross-batch state** is what is being tested |
-
-The Flink job's tests run in the Flink image and the DAGs' in the Airflow
-image, for the same reason. `tests/orchestration/test_ops.py` is plain
-Python and runs in the Spark image too.
+| `unit/test_processor` | decode → validate → normalize → enrich → dedup → features → rules, per event; every reject reason |
+| `unit/test_rules` | each attack blocked with its reason; benign look-alikes allowed |
+| `unit/test_ml` | the compiled model gives LightGBM's own numbers; the model may alert but not block alone; hot-swap and kill switch |
+| `unit/test_dq` | a clean event passes every step boundary; each doubtful case is named where it appears |
+| `unit/test_config`, `test_registry` | secrets from files, never printed; the wire format and registry client |
+| `flink/` | the real job on a local Flink mini-cluster: operators, keyed state, side output, both execution modes |
+| `orchestration/` | the DAGs parse and are wired as documented; checks, rollup, pipeline verdict, training and promotion, the Groq reviewer (against a stand-in API), the evaluator |
 
 CI (`.github/workflows/ci.yml`) runs the same targets, plus a schema
 compatibility gate (§5).
@@ -269,7 +269,7 @@ whose table predates the columns the view reads.
 |---|---|---|
 | `clickhouse_password` | ClickHouse server, pipeline | generated |
 | `grafana_admin_password` | Grafana | generated |
-| `groq_api_key` | detection | **you** — empty disables detection |
+| `groq_api_key` | the hourly LLM review (Airflow) | **you** — empty skips the review; detection is unaffected |
 | `airflow_db_password` | Airflow's Postgres, Airflow | generated |
 | `airflow_admin_password` | Airflow UI (`admin`) | generated |
 | `airflow_jwt_secret` | tokens between Airflow's components | generated, 64 bytes |
@@ -325,22 +325,12 @@ Open Prometheus (`make prometheus` → `/alerts`) or Grafana (`make grafana`).
 | `StreamDataQualityDegraded` | > 1% of events doubtful after normalize/enrich for 10 min (blank users, unknown severities, unplaced IPs, clock skew) | the Grafana panel *Data quality between steps* says which issue; usually one log source changed format |
 | `StreamLogicInconsistent` | **critical** — features or a decision contradicting themselves | a detection bug or corrupted state: compare with the last green test run; restore from a savepoint (§9) |
 | `StreamRejectingEvents` | the job rejected messages in the last 10 min | `SELECT reject_reason, count() FROM rejected_events GROUP BY 1` |
-| `PipelineDown` | (Spark component) driver unreachable | `kubectl logs deploy/pipeline` |
-| `StreamingQueryStopped` | a query died; driver restarting | logs; it resumes from checkpoint |
-| `StreamStalled` | alive but not advancing | the case a liveness probe would miss |
-| `BatchFallingBehind` | batches > trigger interval | lengthen the trigger, or scale executors |
-| `KafkaLagGrowing` | detection behind real time | same as above |
-| `RejectedEventsPresent` | malformed or unregistered data | `SELECT reject_reason, count() FROM rejected_events GROUP BY 1` |
-| `DetectionOutage` | events passing **unjudged** | Groq key / quota / reachability |
-| `DetectionDisabled` | no API key | expected until a key is set |
 | `KafkaUnderReplicatedPartitions` | a broker lagging or down | `make status` |
 | `KafkaBrokerDown` | broker pod down | Strimzi restarts it; check PVC |
 
 **Consumer lag.** Flink commits its offsets to the `watchtower-stream`
 consumer group on every checkpoint, so standard Kafka tooling sees the lag
-(`kafka-consumer-groups.sh --describe --group watchtower-stream`). Spark
-kept its offsets in the checkpoint only; for the Spark component, lag
-comes from its own progress metrics.
+(`kafka-consumer-groups.sh --describe --group watchtower-stream`).
 
 There is no Alertmanager locally (memory): alerts show in the UI but notify
 no one. Adding one Alertmanager Deployment routes them to Slack or email.
@@ -361,23 +351,15 @@ empty the `flink-checkpoints` volume, start them). The job resumes from the
 consumer group's committed offsets, so no event is skipped; only windows
 and dedup memory start empty.
 
-The rest of this section is the Spark path (optional component):
+**A bad model** — roll back by promoting an earlier version (the job picks
+it up within 5 minutes), or switch the model off entirely:
 
-**Driver crash** — the Deployment restarts it; it resumes from the
-checkpoint on the PVC with warm dedup and feature state. Nothing to do.
-
-**Checkpoint corruption / deliberate reset** — the pipeline then restarts
-from `KAFKA_STARTING_OFFSETS` with cold state:
-
-```bash
-kubectl -n watchtower-staging scale deploy/pipeline --replicas=0
-kubectl -n watchtower-staging delete pvc pipeline-checkpoints
-make deploy ENV=staging
+```sql
+INSERT INTO watchtower.ml_model_active (version, reason)
+SELECT version, 'rollback' FROM watchtower.ml_models WHERE version = 'lgbm-...';
 ```
 
-**A state-schema change also needs a checkpoint reset.** Adding a column
-to the feature state (as v2 did: 4 arrays to 9) makes Spark refuse the old
-checkpoint. Reset it as above, knowing dedup and features start cold.
+`WATCHTOWER_ML=off` on the Flink job scores with rules alone.
 
 **After a Docker VM crash, recreate the cluster.** A crash corrupted
 images inside the k3d node: a 0-byte `/run.sh` in Grafana, rejected with
@@ -385,22 +367,18 @@ images inside the k3d node: a 0-byte `/run.sh` in Grafana, rejected with
 it already has and skips them. `make cluster-down && make cluster-up`
 does.
 
-**Never run two pipeline pods.** Two drivers on one checkpoint corrupt it.
-That is why the Deployment is `replicas: 1` with `strategy: Recreate` — a
-rolling update would briefly run two.
-
 ---
 
 ## 10. Known limits of this deployment
 
 - **Checkpoints on a ReadWriteOnce volume.** Flink's checkpoints and HA
-  metadata (and Spark's, for the component) sit on a volume every pod must
+  metadata sit on a volume every pod must
   share -- true on this single-node cluster. Multi-node needs object
   storage (`s3://`).
 - **The Flink image is ~3 GB** -- PyFlink pulls Apache Beam, PyArrow and
   pandas. On arm64 PyFlink also compiles from source (~4 min build).
-- **No LLM on the streaming path yet** -- rules decide in-stream
-  ([`streaming.md`](streaming.md) §7).
+- **The LLM reviews offline, hourly**, never per event: a remote call per
+  event would stall the stream. The model scores live.
 - **One ClickHouse replica.** Sharding is where the Altinity operator
   earns its place.
 - **Prometheus storage is an emptyDir** — metrics history is lost if the

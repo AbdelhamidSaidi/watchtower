@@ -1,9 +1,7 @@
 """The rolling 5-minute window of one source -- the behavioural features.
 
-Engine-free: Flink keeps one RollingWindow per source_ip in keyed state;
-Spark keeps them in applyInPandasWithState bucket state. Same class, same
-numbers (tests/unit/test_features.py checks it against a brute-force
-reference, event by event).
+Engine-free: Flink keeps one RollingWindow per source_ip in keyed state
+(stream/job.py FlinkWindowStore); the tests use MemoryStore.
 """
 
 
@@ -15,7 +13,7 @@ FEATURES = [
     ("requests_1m", "int"),
     ("failed_logins_1m", "int"),
     ("failed_logins_5m", "int"),
-    ("unique_source_ips_5m", "int"),  # always 0 -- see KNOWN GAP in transform/features.py
+    ("unique_source_ips_5m", "int"),  # always 0: keyed by source_ip, it cannot see other sources (docs/context.md)
     ("unique_users_5m", "int"),
     ("port_scan_count_5m", "int"),
     ("unique_ports_5m", "int"),
@@ -79,8 +77,7 @@ def new_summary():
 
 
 class MemoryStore:
-    """Window storage in plain Python objects: for Spark's bucket state and
-    the tests. stream/job.py has the same interface over Flink keyed state,
+    """Window storage in plain Python objects, for the tests. stream/job.py has the same interface over Flink keyed state,
     where every operation touches ONE entry -- so per-event cost does not
     grow with the window, and neither does what a checkpoint rewrites."""
 
@@ -202,7 +199,7 @@ class RollingWindow:
             "requests_1m": m["tail"] - m["head1"],
             "failed_logins_1m": m["failed_1m"],
             "failed_logins_5m": m["failed_5m"],
-            "unique_source_ips_5m": 0,  # see KNOWN GAP in transform/features.py
+            "unique_source_ips_5m": 0,  # keyed by source_ip: see docs/context.md
             "unique_users_5m": m["n_users"],
             "port_scan_count_5m": m["scans_5m"],
             "unique_ports_5m": m["n_ports"],

@@ -5,8 +5,8 @@
 # ~4 GB Docker VM that difference is a Kafka broker.
 #
 # One server, no agents. Every pod lands on the same node, which is what lets
-# the ReadWriteOnce checkpoint volume be shared by the Spark driver and its
-# executors (see deploy/k8s/base/pipeline.yaml).
+# the ReadWriteOnce flink-data volume be shared by the Flink JobManager and
+# its TaskManagers (deploy/k8s/base/stream.yaml).
 apiVersion: k3d.io/v1alpha5
 kind: Simple
 metadata:

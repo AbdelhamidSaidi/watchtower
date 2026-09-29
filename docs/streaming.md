@@ -30,15 +30,12 @@ Python, no engine — and both engines run it:
 
 ```
 etl/core/     vocab, indicators, records (decode/validate/normalize/enrich),
-              window (RollingWindow), rules, processor (dedup+features+rules)
-etl/stream/   the Flink job: the live path
-etl/transform, etl/detect, etl/pipeline.py
-              the Spark job: replays and backfills (optional)
+              window (RollingWindow), rules, ml (the model, compiled),
+              dq (checks between steps), processor (dedup+features+rules+model)
+etl/stream/   the Flink job, and models.py (the active model, from ClickHouse)
 ```
 
-`tests/unit/test_parity.py` sends identical Kafka messages — the producer's
-normal traffic, all nine attacks, v1 messages, every kind of malformed
-message — through both, and requires identical rows and reject reasons.
+The Spark job that preceded Flink was removed on 2026-09-28: one engine.
 
 ## 2. The job
 
@@ -91,10 +88,12 @@ Kafka security-logs
   what it inserted, and keeps a ClickHouse outage from back-pressuring
   detection. A row it cannot parse goes to `rejected_events` as
   `sink_parse_error` instead of stalling the consumer.
-- **LLM.** Not on the per-event path: a remote call per grey-zone event
-  would stall its source's stream. The rules decide in-stream. (PyFlink
-  2.2 has an async operator, which is the way to bring the LLM back without
-  blocking — see §7.)
+- **The model.** A LightGBM model scores every event after the rules, in
+  the same operator, compiled to plain Python when loaded: ~5 µs per
+  event. It is picked up from ClickHouse within 5 minutes of promotion,
+  without a restart; `WATCHTOWER_ML=off` switches it off. The LLM (Groq)
+  never scores live — a remote call per event would stall the stream — it
+  reviews allowed events hourly, offline ([`orchestration.md`](orchestration.md)).
 
 ### Data quality between the steps
 
@@ -279,8 +278,6 @@ Two independent autoscalers, both on Kubernetes (staging and prod):
   partitions onto it after it joins and **off** a broker before Strimzi
   removes it — without the second half, a scale-down would delete the
   only copy of what the broker held.
-- The Spark path has its own executor autoscaler (`etl/scaling/`), used
-  only when the optional Spark component is deployed.
 
 ```bash
 make watch-scaling     # TaskManagers, parallelism, brokers, lag, latency
@@ -304,14 +301,17 @@ flink-taskmanager`, empty the `flink-checkpoints` volume, start again. The
 job resumes from the consumer group's committed offsets, so no event is
 skipped; only the rolling windows start empty.
 
-## 6. Differences from the Spark path
+## 6. Model scoring cost (`tools/bench_model.py`, Flink image, one event per call)
 
-| | Spark | Flink |
-|---|---|---|
-| late events | older than the 10-minute watermark: **dropped** | always scored, as of the newest time seen for that source |
-| dedup horizon | 10 min of event time, global | the source's last 1,024 events (~10 min for an ordinary host, ~25 s at 40 events/s), per source |
-| LLM grey-zone scoring | yes (driver, batched) | not yet (§7) |
-| duplicate event_id from two different sources | dropped | kept (keyed by source) |
+| backend | 200 trees × 31 leaves: p50 / p99 | 100 trees × 15 leaves: p50 / p99 | notes |
+|---|---|---|---|
+| `lightgbm` Booster.predict | 24.7 / 339 µs | 19.5 / 322 µs | built for batches: a 300 µs tail on single rows |
+| ONNX Runtime | 10.4 / 12.8 µs | 6.8 / 9.5 µs | its converter upgrades protobuf and cloudpickle past what PyFlink needs |
+| **compiled to Python** (`core/ml.py`) | 16.2 / 21.7 µs | **5.4 / 7.7 µs** | no library at scoring time; identical output to LightGBM |
+| tl2cgen (C) | — | — | no wheel for arm64; builds from source only |
+
+Training is sized for the stream (≤ 120 trees × 15 leaves), so the model
+costs ~3% of the job's ~173 µs per event.
 
 ## 7. Known limits
 
@@ -329,9 +329,6 @@ skipped; only the rolling windows start empty.
   job computes (the latency percentiles) are pushed into counters from
   the task thread instead (`PushedGauge` in `stream/job.py`); the tests
   fail if a gauge is registered.
-- **LLM.** Re-adding the Groq grey-zone judgement without blocking the
-  stream means an async operator: rows decided by rules go straight out,
-  grey-zone rows get an async LLM verdict and a second, updated row.
 - **One node.** Checkpoints and HA metadata sit on a ReadWriteOnce volume,
   which works because every pod shares the k3d node. Across nodes they
   belong in object storage (s3://).

@@ -1,10 +1,10 @@
 """Deterministic rules for ONE event -- the streaming path's detector.
 
-The same table as detect/rules.py (which evaluates it vectorised over a
-pandas batch for Spark). test_parity.py runs both over the same events and
-requires the same score and the same hits in the same order.
-
-See detect/rules.py for what each rule means and why it scores as it does.
+Each rule is (name, score, fired). An event's score is its strongest
+rule's; `rule_hits` lists every rule that fired, strongest first. Scores
+are how sure a rule is: signatures (bad in themselves) score high, a lone
+probe of a sensitive path only alerts. NOTE_TO_SOC_ANALYST.md explains
+each rule and how to tune it.
 """
 
 import os
@@ -46,8 +46,7 @@ def _rules(e):
     ]
 
 
-# Strongest first, table order among equals -- detect/rules.py sorts the
-# same way (a stable sort on -score).
+# Strongest first, table order among equals (a stable sort on -score).
 _ORDER = sorted(range(16), key=lambda i: -_rules({})[i][1])
 
 
@@ -62,19 +61,14 @@ def action_for(score):
 def score_event(e):
     """Add the detection columns to one event (in place) and return it.
 
-    Rules only: in the streaming path the LLM is not on the per-event
-    critical path (see stream/job.py), so an undecided row says so.
+    Rules only; core/ml.apply() then adds the model's score and settles
+    the final decision.
     """
     rules = _rules(e)
     hits = [rules[i][0] for i in _ORDER if rules[i][2]]
     score = max((rules[i][1] for i in _ORDER if rules[i][2]), default=0.0)
     e["rule_score"] = score
     e["rule_hits"] = ",".join(hits)
-    e["llm_score"] = 0.0
-    e["llm_model"] = ""
-    e["llm_reason"] = (
-        "skipped:rule_decided" if score >= BLOCK_THRESHOLD else "detection_disabled:streaming_rules_only"
-    )
     e["final_anomaly_score"] = score
     e["is_suspicious"] = 1 if score >= SUSPICIOUS_THRESHOLD else 0
     e["recommended_action"] = action_for(score)

@@ -1,9 +1,9 @@
 """
 Shared fixtures.
 
-Everything runs inside the `test` stage of the Spark image
-(docker/spark/Dockerfile), so tests see exactly the jars, Python and
-pyspark the pipeline runs with in production.
+The job's tests run inside the `test` stage of the Flink image
+(docker/flink/Dockerfile), so they see exactly the Python and PyFlink the
+pipeline runs with; the DAGs' run in the Airflow image.
 """
 
 import io
@@ -11,10 +11,13 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime, timezone
 
 import fastavro
 import pytest
+
+# Tests never reach for a ClickHouse to fetch a model: the job scores with
+# rules alone unless a test hands it one (tests/unit/test_ml.py).
+os.environ.setdefault("WATCHTOWER_ML", "off")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for path in (os.path.join(ROOT, "etl"), ROOT):
@@ -24,23 +27,6 @@ for path in (os.path.join(ROOT, "etl"), ROOT):
 from schemas.registry import frame, load_local_schema  # noqa: E402
 
 SCHEMA_ID = 1
-
-
-@pytest.fixture(scope="session")
-def spark():
-    from pyspark.sql import SparkSession
-
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("watchtower-tests")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 @pytest.fixture(scope="session")
@@ -96,29 +82,3 @@ def encode(event, schema_json=None, schema_id=SCHEMA_ID):
     buffer = io.BytesIO()
     fastavro.schemaless_writer(buffer, schema, event)
     return frame(schema_id, buffer.getvalue())
-
-
-def kafka_frame(spark, messages):
-    """A DataFrame with the Kafka source schema, one row per message."""
-    from pyspark.sql.types import (
-        BinaryType,
-        IntegerType,
-        LongType,
-        StringType,
-        StructField,
-        StructType,
-        TimestampType,
-    )
-
-    schema = StructType(
-        [
-            StructField("value", BinaryType()),
-            StructField("topic", StringType()),
-            StructField("partition", IntegerType()),
-            StructField("offset", LongType()),
-            StructField("timestamp", TimestampType()),
-        ]
-    )
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    rows = [(bytearray(m), "security-logs", 0, i, now) for i, m in enumerate(messages)]
-    return spark.createDataFrame(rows, schema)

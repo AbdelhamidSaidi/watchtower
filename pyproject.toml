@@ -2,7 +2,6 @@
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-    "integration: replays a fixed event set through the full streaming chain (slower)",
     "flink: runs the Flink job on a local mini-cluster (Flink image only)",
 ]
 filterwarnings = [

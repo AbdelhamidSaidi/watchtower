@@ -111,3 +111,12 @@ def test_median_time_to_flag_skips_known_sources_and_attacks_already_running():
 def test_attacks_ignore_normal_traffic():
     joined = [("normal", "block", "", BYSTANDER, SINCE + 1)]
     assert attacks(joined, SINCE) == []
+
+
+def test_the_models_own_alerts_are_checked_against_ground_truth():
+    t = Traffic()
+    t.add("port_scan", HOSTILE, SINCE + 60_000, "alert")               # model alone, right
+    t.add("normal", "102.67.14.54", SINCE + 61_000, "alert")           # model alone, wrong
+    t.add("sql_injection", HOSTILE, SINCE + 62_000, "block", "sqli")   # a rule: not the model's
+    s = t.report()["summary"]
+    assert (s["model_only_flags"], s["model_only_attacks"], s["model_only_precision"]) == (2, 1, 0.5)

@@ -9,12 +9,12 @@ SECRETS
 -------
 Secrets are read from FILES, never from plain environment variables:
 
-    GROQ_API_KEY_FILE=/run/secrets/groq_api_key      -> contents of that file
+    CLICKHOUSE_PASSWORD_FILE=/run/secrets/clickhouse_password  -> that file's contents
 
 An environment variable leaks through `docker inspect`, `kubectl describe`,
 /proc/<pid>/environ and crash dumps. A mounted file does not. Compose mounts
 them from ./secrets/ (gitignored); Kubernetes mounts a Secret. The plain
-`GROQ_API_KEY` variable is still honoured as a last resort for ad-hoc local
+variable (e.g. `CLICKHOUSE_PASSWORD`) is still honoured as a last resort for ad-hoc local
 runs, and read_secret() says so on stderr when it is used.
 """
 
@@ -67,11 +67,7 @@ def read_secret(name, default=None):
 KAFKA_BOOTSTRAP_SERVERS = _env("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 KAFKA_TOPIC = _env("KAFKA_TOPIC", "security-logs")
 KAFKA_STARTING_OFFSETS = _env("KAFKA_STARTING_OFFSETS", "latest")
-KAFKA_MAX_OFFSETS_PER_TRIGGER = _env_int("KAFKA_MAX_OFFSETS_PER_TRIGGER", 20000)
-# Split Kafka partitions into at least this many read tasks per batch (0 =
-# one task per partition). Executors added by the autoscaler can only help
-# if a batch has more tasks than the current executors have cores.
-KAFKA_MIN_PARTITIONS = _env_int("KAFKA_MIN_PARTITIONS", 0)
+
 
 # --- Streaming path (stream/job.py) ------------------------------------------
 # Flink writes finished rows to these topics; ClickHouse's Kafka engine
@@ -94,13 +90,6 @@ CHECKPOINT_INTERVAL_MS = _env_int("WATCHTOWER_CHECKPOINT_INTERVAL_MS", 10_000)
 # the detection code, were the bottleneck.
 PYTHON_EXECUTION_MODE = _env("WATCHTOWER_PYTHON_EXECUTION_MODE", "thread")
 
-# --- Executor autoscaling (scaling/executors.py) ---------------------------
-# SPARK_EXECUTORS=auto runs executor pods between these bounds, scaled on
-# batch time vs trigger interval and Kafka lag.
-EXECUTOR_AUTOSCALE = _env("SPARK_EXECUTORS", "0") == "auto"
-EXECUTORS_MIN = _env_int("SPARK_MIN_EXECUTORS", 1)
-EXECUTORS_MAX = _env_int("SPARK_MAX_EXECUTORS", 4)
-
 # --- Schema Registry -------------------------------------------------------
 SCHEMA_REGISTRY_URL = _env("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 SCHEMA_SUBJECT = _env("SCHEMA_SUBJECT", "security-logs-value")
@@ -114,32 +103,3 @@ CLICKHOUSE_DATABASE = _env("CLICKHOUSE_DATABASE", "watchtower")
 
 def clickhouse_password():
     return read_secret("CLICKHOUSE_PASSWORD", default="")
-
-
-EVENTS_TABLE = _env("WATCHTOWER_EVENTS_TABLE", "security_events")
-REJECTED_TABLE = _env("WATCHTOWER_REJECTED_TABLE", "rejected_events")
-
-# --- Streaming ------------------------------------------------------------
-WATERMARK = _env("WATCHTOWER_WATERMARK", "10 minutes")
-TRIGGER_INTERVAL = _env("WATCHTOWER_TRIGGER", "10 seconds")
-
-# Checkpoints hold Kafka offsets AND state-store contents. They must outlive
-# the container: on /tmp, a restart replays from KAFKA_STARTING_OFFSETS with
-# cold dedup and feature state, and duplicates slip through.
-#
-# Driver AND executors write here (executors write the state-store files),
-# so the location must be shared by every Spark process:
-#   compose     a named volume mounted into master and worker
-#   kubernetes  a PersistentVolumeClaim -- fine on one node; multi-node
-#               needs object storage (s3a://), see docs/context.md
-CHECKPOINT_ROOT = _env("WATCHTOWER_CHECKPOINT_ROOT", "file:///var/lib/watchtower/checkpoints")
-
-
-def checkpoint_path(query_name):
-    return f"{CHECKPOINT_ROOT.rstrip('/')}/{query_name}"
-
-
-# --- Observability --------------------------------------------------------
-METRICS_PORT = _env_int("WATCHTOWER_METRICS_PORT", 9108)
-
-APP_NAME = _env("WATCHTOWER_APP_NAME", "watchtower-etl")

@@ -46,15 +46,15 @@ def workload(t):
         "event by id (alert drill-down)":
             f"SELECT * FROM watchtower.{t} WHERE event_id = '{eid}'",
         "one IP, +-15 min (investigation)":
-            f"SELECT timestamp, event_type, user, failed_logins_5m, unique_ports_5m, llm_score, llm_reason "
+            f"SELECT timestamp, event_type, user, failed_logins_5m, unique_ports_5m, ml_score, ml_reason "
             f"FROM watchtower.{t} WHERE source_ip = '{ip}' "
             f"AND timestamp > {a} - INTERVAL 45 MINUTE AND timestamp < {a} - INTERVAL 15 MINUTE ORDER BY timestamp",
         "one IP, whole history":
             f"SELECT count(), countIf(recommended_action = 'block'), min(timestamp), max(timestamp) "
             f"FROM watchtower.{t} WHERE source_ip = '{ip}'",
-        "last 10 min, LLM failures":
+        "last 10 min, model-driven alerts":
             f"SELECT count() FROM watchtower.{t} WHERE timestamp > {a} - INTERVAL 10 MINUTE "
-            f"AND llm_reason LIKE 'llm_error%'",
+            f"AND ml_reason != ''",
         "top blocked IPs, last hour":
             f"SELECT source_ip, count() c FROM watchtower.{t} WHERE timestamp > {a} - INTERVAL 1 HOUR "
             f"AND recommended_action = 'block' GROUP BY source_ip ORDER BY c DESC LIMIT 10",

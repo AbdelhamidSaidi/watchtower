@@ -194,7 +194,7 @@ metadata:
     strimzi.io/cluster: watchtower
 spec:
   # More partitions than brokers on purpose: partitions are the unit of both
-  # Kafka and Spark parallelism, and they can be spread onto brokers added
+  # Kafka and Flink parallelism, and they can be spread onto brokers added
   # later. They cannot easily be reduced, only increased.
   partitions: 6
   replicas: 1

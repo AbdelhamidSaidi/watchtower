@@ -3,7 +3,7 @@ The wire contract between producers and the pipeline.
 
 Everything that decides whether a message can be read lives here: the Avro
 schema file, the Confluent wire format, and the Schema Registry calls.
-Stdlib only, so the producer, the Spark pipeline, the CLI and CI all import
+Stdlib only, so the producer, the Flink job, the CLI and CI all import
 the same code.
 
 WIRE FORMAT (Confluent)

@@ -35,31 +35,16 @@ configMapGenerator:
       - KAFKA_STARTING_OFFSETS=latest
       - SCHEMA_REGISTRY_URL=http://schema-registry:8081
       - CLICKHOUSE_HOST=clickhouse
-      - WATCHTOWER_CHECKPOINT_ROOT=file:///var/lib/watchtower/checkpoints
-      - WATCHTOWER_TRIGGER=20 seconds
-      - WATCHTOWER_SHUFFLE_PARTITIONS=4
-      - SPARK_IMAGE=watchtower/spark:3.5.9
-      - KAFKA_MIN_PARTITIONS=0
-      - SPARK_EXECUTORS=0
-      - SPARK_LOCAL_CORES=2
-      - SPARK_DRIVER_MEMORY=640m
-      - SPARK_EXECUTOR_MEMORY=512m
-      # JVM heap + this = the executor pod's memory. Covers the Python
-      # worker (applyInPandasWithState) and RocksDB, capped below.
-      - SPARK_EXECUTOR_MEMORY_OVERHEAD=384m
-      - SPARK_EXECUTOR_CORES=1
-      - SPARK_EXECUTOR_REQUEST_CORES=250m
-      - SPARK_MIN_EXECUTORS=1
-      - SPARK_MAX_EXECUTORS=3
-      - WATCHTOWER_ROCKSDB_MEMORY_MB=192
       - LOGS_PER_SECOND=100
 
   - name: clickhouse-init
     files:
       - 01_schema.sql=../../../clickhouse/init/01_schema.sql
+      - 01b_ml_columns.sql=../../../clickhouse/init/01b_ml_columns.sql
       - 02_v2_request_context.sql=../../../clickhouse/init/02_v2_request_context.sql
       - 03_streaming_ingest.sql=../../../clickhouse/init/03_streaming_ingest.sql
       - 04_orchestration.sql=../../../clickhouse/init/04_orchestration.sql
+      - 05_ml.sql=../../../clickhouse/init/05_ml.sql
 
   - name: clickhouse-streaming
     files:

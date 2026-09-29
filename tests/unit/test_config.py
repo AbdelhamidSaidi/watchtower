@@ -31,6 +31,3 @@ def test_secret_value_is_never_printed(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "sk-very-secret" not in captured.out + captured.err
 
-
-def test_checkpoints_are_not_on_tmp():
-    assert "/tmp" not in config.CHECKPOINT_ROOT

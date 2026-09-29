@@ -22,36 +22,7 @@ concurrency:
 
 jobs:
   test:
-    name: lint + unit + integration
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build test image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/spark/Dockerfile
-          target: test
-          tags: watchtower/spark:test
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Lint
-        run: docker run --rm watchtower/spark:test python3 -m ruff check etl tools schemas tests producer
-
-      - name: Unit tests
-        run: docker run --rm watchtower/spark:test python3 -m pytest -q -m "not integration"
-
-      - name: Integration tests (full streaming replay)
-        run: docker run --rm watchtower/spark:test python3 -m pytest -q -m integration
-
-  flink:
-    name: streaming job (Flink mini-cluster)
+    name: lint + unit + streaming job (Flink mini-cluster)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -70,8 +41,11 @@ jobs:
           cache-from: type=gha,scope=flink
           cache-to: type=gha,scope=flink,mode=max
 
-      - name: Job tests (real operators, keyed state, side output)
-        run: docker run --rm watchtower/flink:test python3 -m pytest -q -p no:cacheprovider tests/flink tests/unit/test_processor.py
+      - name: Lint
+        run: docker run --rm watchtower/flink:test python3 -m ruff check etl tools schemas tests producer orchestration
+
+      - name: Unit tests (engine-free core) and the job (real operators, keyed state, side output)
+        run: docker run --rm watchtower/flink:test python3 -m pytest -q -p no:cacheprovider tests/unit tests/flink
 
   airflow:
     name: orchestration (Airflow DAGs)
@@ -150,14 +124,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Spark runtime image
+      - name: Flink runtime image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/spark/Dockerfile
+          file: docker/flink/Dockerfile
           target: runtime
-          tags: watchtower/spark:3.5.9
-          cache-from: type=gha
+          tags: watchtower/flink:2.2.1
+          cache-from: type=gha,scope=flink
       - name: Producer image
         uses: docker/build-push-action@v6
         with:

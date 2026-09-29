@@ -1,8 +1,8 @@
 """Signatures and reference data for enrichment.
 
-Regexes are written to mean the same thing in Java (Spark's rlike) and in
-Python's `re` -- inline (?i) at the start, no possessive quantifiers, no
-lookbehind -- because both engines evaluate them. test_parity.py checks.
+Regexes are Python `re`, kept portable -- inline (?i) at the start, no
+possessive quantifiers, no lookbehind -- so ClickHouse's `match()` can run
+the same pattern when an analyst re-checks stored events.
 """
 
 # RFC1918 plus loopback. Anchored, and the 172.16/12 branch is spelled out

@@ -9,8 +9,6 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-SPARK_IMAGE    := watchtower/spark:3.5.9
-TEST_IMAGE     := watchtower/spark:test
 PRODUCER_IMAGE := watchtower/producer:1.0
 FLINK_IMAGE    := watchtower/flink:2.2.1
 FLINK_TEST     := watchtower/flink:test
@@ -27,7 +25,7 @@ NODE           := k3d-$(CLUSTER)-server-0
 
 # Every image the cluster runs. All are loaded from the host, so nothing
 # inside the cluster pulls from the internet.
-CLUSTER_IMAGES := $(FLINK_IMAGE) $(SPARK_IMAGE) $(PRODUCER_IMAGE) $(AIRFLOW_IMAGE) \
+CLUSTER_IMAGES := $(FLINK_IMAGE) $(PRODUCER_IMAGE) $(AIRFLOW_IMAGE) \
                   postgres:18.6-alpine \
                   ghcr.io/apache/flink-kubernetes-operator:1c895a3 \
                   ghcr.io/aiven-open/karapace:6.2.3 \
@@ -51,7 +49,7 @@ secrets:  ## Generate missing local secret files (never overwrites)
 ##@ Images
 
 .PHONY: images
-images: image-flink image-spark image-producer image-airflow  ## Build all runtime images
+images: image-flink image-producer image-airflow  ## Build all runtime images
 
 .PHONY: image-flink
 image-flink:  ## Build the Flink streaming image (the live path)
@@ -69,13 +67,6 @@ image-airflow:  ## Build the Airflow image (orchestration: data quality, rollups
 image-airflow-test:  ## Build the Airflow test image
 	docker build --target test -t $(AIRFLOW_TEST) -f docker/airflow/Dockerfile .
 
-.PHONY: image-spark
-image-spark:  ## Build the Spark runtime image
-	docker build --target runtime -t $(SPARK_IMAGE) -f docker/spark/Dockerfile .
-
-.PHONY: image-test
-image-test:  ## Build the test image (runtime + pytest + tests)
-	docker build --target test -t $(TEST_IMAGE) -f docker/spark/Dockerfile .
 
 .PHONY: image-producer
 image-producer:  ## Build the producer image
@@ -84,20 +75,19 @@ image-producer:  ## Build the producer image
 ##@ Quality (CI runs exactly these)
 
 .PHONY: lint
-lint: image-test  ## Ruff: pyflakes + syntax errors
-	docker run --rm $(TEST_IMAGE) python3 -m ruff check etl tools schemas tests producer orchestration
+lint: image-flink-test  ## Ruff: pyflakes + syntax errors
+	docker run --rm $(FLINK_TEST) python3 -m ruff check etl tools schemas tests producer orchestration
 
 .PHONY: test-unit
-test-unit: image-test  ## Unit tests
-	docker run --rm $(TEST_IMAGE) python3 -m pytest -q -m "not integration"
+test-unit: image-flink-test  ## Engine-free unit tests (etl/core, config, registry): seconds
+	docker run --rm $(FLINK_TEST) python3 -m pytest -q -p no:cacheprovider tests/unit
 
 .PHONY: test
-test: image-test test-flink test-airflow  ## Unit + integration tests (Spark replay, Flink job, DAGs)
-	docker run --rm $(TEST_IMAGE) python3 -m pytest -q
+test: test-flink test-airflow  ## Every suite: unit, the Flink job, the DAGs
 
 .PHONY: test-flink
-test-flink: image-flink-test  ## The Flink job end to end on a local mini-cluster
-	docker run --rm $(FLINK_TEST) python3 -m pytest -q -p no:cacheprovider tests/flink tests/unit/test_processor.py
+test-flink: image-flink-test  ## Unit tests + the Flink job end to end on a local mini-cluster
+	docker run --rm $(FLINK_TEST) python3 -m pytest -q -p no:cacheprovider tests/unit tests/flink
 
 .PHONY: test-airflow
 test-airflow: image-airflow-test  ## The DAGs parse and are wired as documented; their ops and the evaluator
@@ -119,7 +109,7 @@ ci: lint test render  ## Everything CI runs
 ##@ Dev (docker compose)
 
 .PHONY: dev-up
-dev-up: secrets image-flink image-spark  ## Start the dev stack (Flink live path)
+dev-up: secrets image-flink image-producer  ## Start the dev stack (Flink live path)
 	docker compose up -d
 	@echo "flink ui: http://localhost:8082   job metrics: http://localhost:9250/metrics"
 
