@@ -133,6 +133,10 @@ quickstart: dev-up  ## One command: secrets, images, the stack, a producer (QS_R
 	@echo "  make airflow-up  add Airflow (lowers the producer to 100/s)"
 	@echo "  make dev-down    stop everything (keeps the data)"
 
+.PHONY: smoke-dev
+smoke-dev:  ## End-to-end smoke test of the running dev stack (start it with `make quickstart`)
+	./tools/smoke_dev.sh
+
 .PHONY: dev-down
 dev-down:  ## Stop the dev stack (keeps volumes)
 	docker compose --profile sim --profile airflow --profile monitoring down

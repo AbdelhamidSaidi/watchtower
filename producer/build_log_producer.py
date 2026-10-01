@@ -77,7 +77,7 @@ MAX_INCIDENT_SHARE = 0.25
 
 # Chance per second that a new incident of a given kind begins, when none of
 # that kind is already running.
-INCIDENT_START_CHANCE = 0.003
+INCIDENT_START_CHANCE = float(os.getenv("INCIDENT_START_CHANCE", "0.003"))
 
 
 # --- the company ----------------------------------------------------------

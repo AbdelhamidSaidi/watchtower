@@ -271,6 +271,8 @@ services:
       KAFKA_BROKER: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       LOGS_PER_SECOND: ${LOGS_PER_SECOND:-1000}
+      # Raised by the CI smoke test, so an incident is certain within a minute.
+      INCIDENT_START_CHANCE: ${INCIDENT_START_CHANCE:-0.003}
     restart: unless-stopped
 
   # --- orchestration (profile: airflow) -------------------------------------

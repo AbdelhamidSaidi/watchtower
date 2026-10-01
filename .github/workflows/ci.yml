@@ -42,7 +42,7 @@ jobs:
           cache-to: type=gha,scope=flink,mode=max
 
       - name: Lint
-        run: docker run --rm watchtower/flink:test python3 -m ruff check etl tools schemas tests producer orchestration
+        run: docker run --rm watchtower/flink:test python3 -m ruff check etl tools schemas tests producer orchestration monitor
 
       - name: Unit tests (engine-free core) and the job (real operators, keyed state, side output)
         run: docker run --rm watchtower/flink:test python3 -m pytest -q -p no:cacheprovider tests/unit tests/flink
@@ -106,6 +106,60 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  smoke:
+    name: end-to-end smoke (docker compose stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The images the dev stack runs. Built here with the layer cache the
+      # other jobs share, then found locally by `docker compose up`.
+      - name: Flink runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/flink/Dockerfile
+          target: runtime
+          tags: watchtower/flink:2.2.1
+          load: true
+          cache-from: type=gha,scope=flink
+      - name: Producer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/producer/Dockerfile
+          tags: watchtower/producer:1.0
+          load: true
+          cache-from: type=gha,scope=producer
+          cache-to: type=gha,scope=producer,mode=max
+
+      - name: Start the stack and the simulator
+        run: |
+          ./deploy/k8s/scripts/secrets.sh
+          # 50 events/s is plenty for a smoke test; incidents are made frequent
+          # so one is certain within a minute.
+          LOGS_PER_SECOND=50 INCIDENT_START_CHANCE=0.05 docker compose --profile sim up -d
+
+      - name: Install the evaluator's dependencies
+        run: pip install kafka-python fastavro
+
+      # Behaviour, not container status: the job runs, events are stored once,
+      # nothing is rejected, the rules flag the simulator's incidents, latency
+      # is in budget, and detection matches the simulator's ground truth.
+      - name: Smoke test
+        run: tools/smoke_dev.sh
+
+      - name: Logs (on failure)
+        if: failure()
+        run: docker compose --profile sim logs --tail=150
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile sim down -v
 
   manifests:
     name: kubernetes manifests
