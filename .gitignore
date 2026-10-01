@@ -2,6 +2,9 @@
 # See secrets/README in docs/context.md for how they are provisioned.
 secrets/*
 !secrets/.gitkeep
+# Empty placeholders: one file per secret, so the names are visible in the repo.
+# `make secrets` creates the real files next to them (never from these).
+!secrets/*.example
 .env
 
 # Python

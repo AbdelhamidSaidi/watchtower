@@ -113,6 +113,26 @@ dev-up: secrets image-flink image-producer  ## Start the dev stack (Flink live p
 	docker compose up -d
 	@echo "flink ui: http://localhost:8082   job metrics: http://localhost:9250/metrics"
 
+# One command from a clean checkout to live results. 10 events/s by default:
+# the 1,000/s stack alone fills a ~4 GB Docker VM (see airflow-up), and 10/s
+# is plenty to see every part work. QS_RATE=100 make quickstart for more.
+QS_RATE ?= 10
+
+.PHONY: quickstart
+quickstart: dev-up  ## One command: secrets, images, the stack, a producer (QS_RATE=10 events/s) and a live check
+	LOGS_PER_SECOND=$(QS_RATE) docker compose --profile sim up -d --force-recreate --no-deps producer
+	@echo "waiting for the first stored events (up to 3 min)..."
+	@for i in $$(seq 1 36); do \
+	  n=$$(docker exec watchtower-clickhouse sh -c 'clickhouse-client --user watchtower --password "$$(cat /run/secrets/clickhouse_password)" -q "SELECT count() FROM watchtower.security_events"' 2>/dev/null); \
+	  [ "$${n:-0}" -gt 0 ] 2>/dev/null && break; sleep 5; done
+	@docker exec watchtower-clickhouse sh -c 'clickhouse-client --user watchtower --password "$$(cat /run/secrets/clickhouse_password)" --format PrettyCompact -q "SELECT recommended_action AS action, count() AS events, countIf(notEmpty(rule_hits)) AS with_rule_hits FROM watchtower.security_events GROUP BY action ORDER BY action"'
+	@echo ""
+	@echo "running at $(QS_RATE) events/s. Next:"
+	@echo "  make latency     end-to-end latency, last minute"
+	@echo "  make evaluate    detection vs the simulator's ground truth (give it a few minutes of traffic first)"
+	@echo "  make airflow-up  add Airflow (lowers the producer to 100/s)"
+	@echo "  make dev-down    stop everything (keeps the data)"
+
 .PHONY: dev-down
 dev-down:  ## Stop the dev stack (keeps volumes)
 	docker compose --profile sim --profile airflow --profile monitoring down

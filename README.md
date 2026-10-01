@@ -17,7 +17,7 @@ Built for the Sekera Services internship *« Conception d'un pipeline de traitem
 3. [The life of an event](#3-the-life-of-an-event)
 4. [Detection: rules, a model, and an AI reviewer](#4-detection-rules-a-model-and-an-ai-reviewer)
 5. [Orchestration and MLOps (Airflow)](#5-orchestration-and-mlops-airflow)
-6. [Data model (ClickHouse)](#6-data-model-clickhouse)
+6. [Data model and lineage (ClickHouse)](#6-data-model-and-lineage-clickhouse)
 7. [Technology stack](#7-technology-stack)
 8. [Repository layout](#8-repository-layout)
 9. [Getting started](#9-getting-started)
@@ -196,7 +196,7 @@ Every check records its result before it can fail, so a broken run keeps its evi
 
 ---
 
-## 6. Data model (ClickHouse)
+## 6. Data model and lineage (ClickHouse)
 
 | table / view | holds |
 |---|---|
@@ -215,6 +215,49 @@ Every check records its result before it can fail, so a broken run keeps its evi
 The sort key makes drill-downs cheap — measured on 43M events of the earlier workload: one event by id 683 MB → 3 MB read; one runner's whole history 1 GB → 5 MB (`make ch-bench`).
 
 Schema files: `clickhouse/init/01…05_*.sql`, applied in order by `make ch-migrate` (idempotent). **An install created before the switch to build logs has the old columns**: see [`docs/operations.md`](docs/operations.md) "Switching an existing install to build logs".
+
+
+### Data lineage
+
+Where every row comes from, and where it goes.
+
+```
+simulator (producer/build_log_producer.py)                   the only place `scenario` (ground truth) is written
+   │ Avro, schema id from the registry
+   ▼
+Kafka  security-logs ───────────────────────────────────────────────┐ read back later by:
+   │                                                                │  · tools/evaluate_detection.py, monitor  (ground truth)
+   ▼                                                                │  · watchtower_review                     (simulator labels)
+Flink job: decode → validate → normalize → enrich → window → rules → model
+   │  each step adds columns; `scenario` is never read
+   ├──► Kafka  security-events-scored ──► ClickHouse Kafka engine ──► security_events ──► suspicious_events (MV)
+   └──► Kafka  security-logs-rejected ──► ClickHouse Kafka engine ──► rejected_events      (+ rows ClickHouse could not parse)
+                                                    ▲
+Flink ◄──── ml_models / ml_model_active (polled every 5 min) ◄── watchtower_training ◄── security_events + training_labels
+```
+
+**Who writes and reads each table**
+
+| table | written by | read by | kept |
+|---|---|---|---|
+| `security_events` | Flink, through Kafka and the Kafka engine | every Airflow DAG, the evaluator, the monitor, dashboards, you | 30 days |
+| `suspicious_events` | materialized view over `security_events` | you (the work queue) | 90 days |
+| `rejected_events` | Flink (dead letters), and the Kafka engine for rows it cannot parse | `watchtower_data_quality`, you | 30 days |
+| `pipeline_health` | `watchtower_pipeline` | other DAGs, before they trust live data | 90 days |
+| `data_quality_checks` | `watchtower_data_quality` | you | 180 days |
+| `daily_summary`, `daily_rule_hits`, `daily_top_sources` | `watchtower_daily`, from `security_events FINAL` | you | 400 days |
+| `detection_quality` | `watchtower_detection_quality`: Kafka ground truth joined to `security_events` | you, alerts | 400 days |
+| `training_labels` | `watchtower_review`: the simulator's labels (from Kafka) and the reviewer's | `watchtower_training` | 90 days |
+| `event_reviews` | `watchtower_review`: Groq's verdicts on events sampled from `security_events` | `label_changes`, `ml_model_review`, the guard | 365 days |
+| `ml_models`, `ml_model_active` | `watchtower_training` (a promotion or the guard's rollback is an insert) | the Flink job, over HTTP | 365 days / forever |
+
+**How one value travels: a compiler crash.** The tool's error line is the raw field `error_message`. *Enrich* turns it into `failure_signature = ice` and `is_failure_signature = 1`. The runner's 5-minute window counts it into `failure_signatures_5m`. *Rules* read both: `compiler_crash` (the single event) and `repeated_failure_signatures` (five in five minutes) set `rule_score` and `rule_hits`. The *model* sees the same columns and sets `ml_score`. `final_anomaly_score = max(rule, model)` becomes `recommended_action`; at `alert` or above `is_suspicious = 1`, and the materialized view copies the row into `suspicious_events`. Every one of those columns is stored on the same `security_events` row, so a decision can be explained from the row alone (`rule_hits`, `ml_reason`).
+
+**The model's lineage.** `security_events` (features) joined to `training_labels` (what each event really was, and who said so) trains a model; `ml_models` keeps its dump and its holdout metrics; `ml_model_active` names the live one; the Flink job fetches it and stamps its version into `ml_model` on every row it scores. So any stored decision names the model that made it, and an older version can be put back with one insert.
+
+**Ground truth never reaches detection.** `scenario` is written by the simulator, carried in Kafka, and read only by the evaluator, the monitor and the label collector. The Flink job's decoder does not list it.
+
+The column-level contract is `etl/core/columns.py` (the stored columns) with `clickhouse/init/01_schema.sql` and `03_streaming_ingest.sql` (kept in step); the field contract is `schemas/build_event.avsc`.
 
 ---
 
@@ -275,6 +318,48 @@ Watchtower/
 
 ## 9. Getting started
 
+### Quickstart
+
+```bash
+make quickstart
+```
+
+One command from a clean checkout to live results. It generates the secrets, builds the images, starts Kafka, the registry, ClickHouse and Flink, runs the simulator at **10 events/s** (`QS_RATE=100 make quickstart` for more), waits for the first stored events and prints the decisions so far:
+
+```
+┌─action─────┬──events─┬─with_rule_hits─┐
+│ alert      │     326 │            326 │
+│ ok         │ 1459964 │              0 │
+│ quarantine │   21356 │          21356 │
+└────────────┴─────────┴────────────────┘
+```
+
+(Totals include earlier runs when the volumes are kept.) It needs Docker running with at least ~3 GB for its VM at this rate (2.0–2.5 GB of it was used in the run); the first run builds the images and takes several minutes.
+
+### How to run
+
+| goal | command | what runs | Docker memory (containers, 2026-10-01 runs) |
+|---|---|---|---|
+| see it work | `make quickstart` | Kafka, registry, ClickHouse, Flink, the simulator at 10/s | ~2.0–2.5 GB measured at 10/s |
+| the same, faster traffic | `QS_RATE=100 make quickstart` | same, 100 events/s | not measured |
+| add the batch side | `make airflow-up` | + Airflow and its Postgres; the producer is set to 100/s | + ~0.25 GB measured for Airflow |
+| full speed | `docker compose --profile sim up -d` | the simulator at 1,000 events/s | ~2.3–2.8 GB measured; swap filled on a 3.8 GB VM |
+| dashboards | `make monitor-up` | + Prometheus, Grafana, the live-audit exporter | not measured |
+
+Once it runs:
+
+| to | do |
+|---|---|
+| see the decisions | `make latency` (event → row latency), `make evaluate` (detection vs ground truth; give it a few minutes of traffic) |
+| look at the data | ClickHouse at http://localhost:8123 (user `watchtower`, password in `secrets/clickhouse_password`), e.g. `SELECT * FROM watchtower.suspicious_events ORDER BY timestamp DESC LIMIT 20` |
+| watch the job | Flink UI http://localhost:8082 |
+| operate the batch side | Airflow UI http://localhost:8080 (user `admin`, password in `secrets/airflow_admin_password`); DAGs start paused |
+| turn on the AI reviewer | `printf '%s' 'gsk_…' > secrets/groq_api_key`, then unpause `watchtower_review` and `watchtower_training` |
+| stop (keeps the data) | `make dev-down` |
+| wipe everything | `docker compose --profile sim --profile airflow --profile monitoring down -v` — **deletes the Kafka, ClickHouse, Flink and Airflow volumes** |
+
+The numbered steps below explain each part. Tests: `make test`; lint: `make lint`.
+
 ### Prerequisites
 
 - **Docker** with at least **4 GB** for its VM (Docker Desktop → Settings → Resources). The dev stack at 1,000 events/s uses ~3 GB; with Airflow, run the producer at 100 events/s (see below). 8 GB or more makes everything comfortable.
@@ -287,7 +372,7 @@ Watchtower/
 make secrets
 ```
 
-Generates random passwords into `secrets/` (git-ignored, mode 600): ClickHouse, Grafana, Airflow's database, admin and signing key. `secrets/groq_api_key` starts empty — see step 4.
+Generates random passwords into `secrets/` (git-ignored, mode 600): ClickHouse, Grafana, Airflow's database, admin and signing key. `secrets/groq_api_key` starts empty — see step 4. `secrets/<name>.example` are committed, empty placeholders that list every secret by name; the real files sit beside them and are never overwritten.
 
 ### 2. The online path
 
