@@ -43,7 +43,7 @@ from orchestration.ops import training
 )
 def watchtower_training():
 
-    # Holds the dataset in memory: 14 days of labels (all attack events, 2%
+    # Holds the dataset in memory: 14 days of labels (all incident events, 2%
     # of normal ones) -- ~100-300k rows at 1,000 events/s.
     @task(execution_timeout=timedelta(hours=1))
     def train_and_promote():

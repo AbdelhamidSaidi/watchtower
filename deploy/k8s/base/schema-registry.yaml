@@ -108,7 +108,7 @@ spec:
       port: 8081
       targetPort: http
 ---
-# Registers schemas/security_event.avsc with BACKWARD compatibility.
+# Registers schemas/build_event.avsc with BACKWARD compatibility.
 #
 # This Job is the ONLY path by which a schema reaches the registry: producers
 # look their schema up and refuse to start if it is absent. The CLI exits 2

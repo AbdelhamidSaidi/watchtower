@@ -10,26 +10,28 @@ import json
 
 from etl import config
 
-# What a healthy run looks like. Measured on the Flink path at 1,000
-# events/s over 15 minutes: coverage 100%, 29/29 attacks caught, the first
-# flag 0.4-1.6 s into an attack, 7 of 868,112 normal events blocked on
-# uninvolved hosts (0.0008%). The thresholds leave room below that.
+# What a healthy run looks like. The thresholds were set on the Flink path
+# at 1,000 events/s over 15 minutes with the earlier (security-log)
+# simulator: coverage 100%, every incident caught, the first flag 0.4-1.6 s
+# in, under 0.001% of normal events quarantined on uninvolved runners. They
+# have not been re-measured on build-farm traffic (`make evaluate`); the
+# simulator's incidents are tuned to the same rates, so they should hold.
 #
-# Attacks are judged one by one -- was each caught, and how fast -- not by
-# the share of attack EVENTS flagged. That share depends on the mix: a
-# behavioural rule needs its first few events (7 for lateral movement, 19
-# for a password spray) before it can fire, so a window holding two small
-# attacks came out at 91.9% with both caught within 1.5 s, while the
-# 29-attack window above came out at 99.3%. It is reported, not gated.
+# Incidents are judged one by one -- was each caught, and how fast -- not by
+# the share of incident EVENTS flagged. That share depends on the mix: a
+# behavioural rule needs its first few events (20 for a failure storm, 8
+# projects for a broken toolchain) before it can fire, so a window holding
+# two small incidents can come out well under 100% with both caught within
+# seconds. It is reported, not gated.
 THRESHOLDS = {
     # Every event read from Kafka has a decision in ClickHouse.
     "min_coverage": 0.999,
-    "max_missed_attacks": 0,
-    # From an attack's first event to its first flag, for sources with no
-    # attack in the 5 minutes before (tools/evaluate_detection.py).
+    "max_missed_incidents": 0,
+    # From an incident's first event to its first flag, for runners with no
+    # incident in the 5 minutes before (tools/evaluate_detection.py).
     "max_median_time_to_flag_s": 5.0,
-    # Normal traffic blocked on hosts that were NOT attacking.
-    "max_uninvolved_blocked_share": 0.0001,
+    # Normal traffic quarantined on runners that were NOT affected.
+    "max_uninvolved_quarantined_share": 0.0001,
 }
 
 
@@ -57,21 +59,21 @@ def assess(report, thresholds=None):
     if s["coverage"] is not None and s["coverage"] < t["min_coverage"]:
         failures.append(f"coverage {s['coverage']:.4%} < {t['min_coverage']:.4%}: "
                         "events in Kafka without a decision in ClickHouse")
-    # A window without attacks says nothing about catching them.
-    if s["attacks_seen"]:
-        missed = s["attacks_seen"] - s["attacks_caught"]
-        if missed > t["max_missed_attacks"]:
-            failures.append(f"{missed} of {s['attacks_seen']} attacks never flagged")
+    # A window without incidents says nothing about catching them.
+    if s["incidents_seen"]:
+        missed = s["incidents_seen"] - s["incidents_caught"]
+        if missed > t["max_missed_incidents"]:
+            failures.append(f"{missed} of {s['incidents_seen']} incidents never flagged")
         median = s["median_time_to_flag_s"]
         if median is not None and median > t["max_median_time_to_flag_s"]:
             failures.append(f"median time to first flag {median:.1f} s "
                             f"> {t['max_median_time_to_flag_s']:.1f} s")
     if s["normal_events"]:
-        share = s["normal_blocked_uninvolved"] / s["normal_events"]
-        if share > t["max_uninvolved_blocked_share"]:
-            failures.append(f"normal events blocked on uninvolved hosts {share:.4%} "
-                            f"> {t['max_uninvolved_blocked_share']:.4%} "
-                            f"({s['normal_blocked_uninvolved']} of {s['normal_events']})")
+        share = s["normal_quarantined_uninvolved"] / s["normal_events"]
+        if share > t["max_uninvolved_quarantined_share"]:
+            failures.append(f"normal events quarantined on uninvolved runners {share:.4%} "
+                            f"> {t['max_uninvolved_quarantined_share']:.4%} "
+                            f"({s['normal_quarantined_uninvolved']} of {s['normal_events']})")
     return failures
 
 
@@ -83,14 +85,14 @@ def row(report, failures, run_id):
         "window_minutes": report["window"]["minutes"],
         "events": report["window"]["events"],
         "coverage": s["coverage"],
-        "attacks_seen": s["attacks_seen"],
-        "attacks_caught": s["attacks_caught"],
-        "attack_events_flagged": s["attack_flagged"],
-        "attack_events_blocked": s["attack_blocked"],
-        "normal_blocked": s["normal_blocked"],
-        "normal_blocked_uninvolved": s["normal_blocked_uninvolved"],
+        "incidents_seen": s["incidents_seen"],
+        "incidents_caught": s["incidents_caught"],
+        "incident_events_flagged": s["incident_flagged"],
+        "incident_events_quarantined": s["incident_quarantined"],
+        "normal_quarantined": s["normal_quarantined"],
+        "normal_quarantined_uninvolved": s["normal_quarantined_uninvolved"],
         "normal_events": s["normal_events"],
-        "precision_block": s["precision_block"],
+        "precision_quarantine": s["precision_quarantine"],
         "median_time_to_flag_s": s["median_time_to_flag_s"],
         "passed": 0 if failures else 1,
         "failures": failures,

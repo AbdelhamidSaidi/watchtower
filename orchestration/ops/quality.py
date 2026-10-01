@@ -3,7 +3,7 @@
 Prometheus (deploy/observability/alerts.yml) watches the PIPELINE: is the
 job up, is it keeping up, how long does an event take. These checks watch
 the DATA it wrote, one closed hour at a time: was anything stored, did too
-much get refused, are rows complete, did the share of blocks jump.
+much get refused, are rows complete, did the share of quarantines jump.
 
 Each check is one SQL query returning one number, compared to a threshold.
   fail  -- the DAG run fails (and alerts, via Airflow's own notifications)
@@ -49,11 +49,11 @@ CHECKS = (
           f"         WHERE kafka_timestamp >= {START} AND kafka_timestamp < {END}) AS r,"
           f"        (SELECT count() FROM {EVENTS} WHERE {IN_HOUR}) AS e)"),
 
-    # Detection is keyed by source_ip; an event without one, or without a
+    # Detection is keyed by runner_ip; an event without one, or without a
     # type, was scored against nothing.
     Check("missing_identity", "fail", "==", 0,
-          "events with an empty source_ip or event_type",
-          f"SELECT countIf(source_ip = '' OR event_type = '') FROM {EVENTS} WHERE {IN_HOUR}"),
+          "events with an empty runner_ip or event_type",
+          f"SELECT countIf(runner_ip = '' OR event_type = '') FROM {EVENTS} WHERE {IN_HOUR}"),
 
     # Hourly and looser than the StreamLatencyHigh alert: a slow hour that
     # the alert missed, e.g. while Prometheus was down.
@@ -71,14 +71,14 @@ CHECKS = (
           f" SELECT (SELECT count() FROM {EVENTS} WHERE {IN_HOUR}) AS a,"
           f"        (SELECT count() FROM {EVENTS} FINAL WHERE {IN_HOUR}) AS f)"),
 
-    # Five times the usual share of blocks is either an attack wave or a
-    # rule gone wrong. Either way a human should look.
-    Check("block_share_vs_7d", "warn", "<=", 5.0,
-          "the hour's share of blocks, as a multiple of the trailing 7 days'",
+    # Five times the usual share of quarantines is either an incident wave
+    # (a bad commit, a registry outage) or a rule gone wrong. Either way a human should look.
+    Check("quarantine_share_vs_7d", "warn", "<=", 5.0,
+          "the hour's share of quarantines, as a multiple of the trailing 7 days'",
           "SELECT h / nullIf(w, 0) FROM ("
-          " SELECT (SELECT countIf(recommended_action = 'block') / nullIf(count(), 0)"
+          " SELECT (SELECT countIf(recommended_action = 'quarantine') / nullIf(count(), 0)"
           f"         FROM {EVENTS} WHERE {IN_HOUR}) AS h,"
-          "        (SELECT countIf(recommended_action = 'block') / nullIf(count(), 0)"
+          "        (SELECT countIf(recommended_action = 'quarantine') / nullIf(count(), 0)"
           f"         FROM {EVENTS}"
           f"         WHERE timestamp >= {START} - INTERVAL 7 DAY AND timestamp < {START}) AS w)"),
 )

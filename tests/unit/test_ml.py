@@ -25,19 +25,19 @@ def split(feature, threshold, left, right, value=0.0):
             "left_child": left, "right_child": right, "internal_value": value}
 
 
-# Raw score: -4 for a quiet event; +6 with 20+ failed logins in 5 minutes
+# Raw score: -4 for a quiet event; +6 with 20+ failed builds in 5 minutes
 # (p ~0.88), a little more at night.
 DUMP = {
     "objective": "binary sigmoid:1",
     "feature_names": list(ml.FEATURES),
     "tree_info": [
-        {"tree_structure": split("failed_logins_5m", 19.5, leaf(-4.0), leaf(2.0), value=-3.0)},
+        {"tree_structure": split("failed_builds_5m", 19.5, leaf(-4.0), leaf(2.0), value=-3.0)},
         {"tree_structure": split("is_night", 0.5, leaf(0.0), leaf(0.5), value=0.1)},
     ],
 }
 
-QUIET = {"event_type": "LOGIN_FAILURE", "failed_logins_5m": 3, "is_night": 0}
-NOISY = {"event_type": "LOGIN_FAILURE", "failed_logins_5m": 25, "is_night": 0}
+QUIET = {"event_type": "BUILD_FAILURE", "failed_builds_5m": 3, "is_night": 0}
+NOISY = {"event_type": "BUILD_FAILURE", "failed_builds_5m": 25, "is_night": 0}
 
 
 def scored(event, model):
@@ -56,45 +56,44 @@ def test_no_model_means_rules_alone():
     assert (event["ml_score"], event["ml_model"], event["ml_reason"]) == (0.0, "", "")
 
 
-def test_the_model_alone_can_alert_but_not_block(monkeypatch):
-    monkeypatch.setattr(ml, "ML_CAN_BLOCK", False)
-    # 25 failures in 5 min is below the brute-force rule's 1-minute line:
+def test_the_model_alone_can_alert_but_not_quarantine(monkeypatch):
+    monkeypatch.setattr(ml, "ML_CAN_QUARANTINE", False)
+    # 25 failures in 5 min is below the failure-storm rule's 1-minute line:
     # no rule fires, the model says 0.88.
     event = scored(NOISY, ml.Model(DUMP, "v1"))
     assert event["rule_hits"] == "" and event["ml_score"] > 0.85
     assert event["recommended_action"] == "alert"
-    assert event["ml_reason"] == "ml: failed_logins_5m"
+    assert event["ml_reason"] == "ml: failed_builds_5m"
 
 
-def test_it_can_block_once_allowed_to(monkeypatch):
-    monkeypatch.setattr(ml, "ML_CAN_BLOCK", True)
-    assert scored(NOISY, ml.Model(DUMP, "v1"))["recommended_action"] == "block"
+def test_it_can_quarantine_once_allowed_to(monkeypatch):
+    monkeypatch.setattr(ml, "ML_CAN_QUARANTINE", True)
+    assert scored(NOISY, ml.Model(DUMP, "v1"))["recommended_action"] == "quarantine"
 
 
 def test_the_model_never_lowers_what_a_rule_decided():
-    sqli = {"event_type": "HTTP_REQUEST", "request_signature": "sqli", "is_attack_signature": 1}
-    event = scored(sqli, ml.Model(DUMP, "v1"))       # the model sees nothing wrong
-    assert event["ml_score"] < 0.1 and event["recommended_action"] == "block"
+    crash = {"event_type": "COMPILE_STEP", "failure_signature": "ice", "is_failure_signature": 1}
+    event = scored(crash, ml.Model(DUMP, "v1"))      # the model sees nothing wrong
+    assert event["ml_score"] < 0.1 and event["recommended_action"] == "quarantine"
     assert event["ml_reason"] == ""                  # the rules decided, not the model
 
 
-def test_a_higher_score_on_a_rule_decided_block_is_not_the_models_decision(monkeypatch):
-    # A block-level rule fired (brute force, 0.90); the model scores the
-    # event higher still. The decision is the rule's: no ml_reason. Measured
-    # 2026-09-29: 4,051 of 4,254 rule blocks carried a model reason before.
-    monkeypatch.setattr(ml, "ML_CAN_BLOCK", False)
-    event = scored({**NOISY, "failed_logins_1m": 25, "is_night": 1}, ml.Model(DUMP, "v1"))   # model ~0.92
-    assert event["rule_hits"] and event["recommended_action"] == "block"
+def test_a_higher_score_on_a_rule_decided_quarantine_is_not_the_models_decision(monkeypatch):
+    # A quarantine-level rule fired (failure storm, 0.90); the model scores
+    # the event higher still. The decision is the rule's: no ml_reason.
+    monkeypatch.setattr(ml, "ML_CAN_QUARANTINE", False)
+    event = scored({**NOISY, "failed_builds_1m": 25, "is_night": 1}, ml.Model(DUMP, "v1"))   # model ~0.92
+    assert event["rule_hits"] and event["recommended_action"] == "quarantine"
     assert event["ml_score"] > event["rule_score"] and event["ml_reason"] == ""
 
 
-def test_raising_an_alert_level_rule_to_block_is_the_models_decision(monkeypatch):
-    # A lone sensitive-path probe alerts (0.70); the model, sure, takes it to
-    # block -- allowed, a rule agrees -- and says why.
-    monkeypatch.setattr(ml, "ML_CAN_BLOCK", False)
-    probe = {**NOISY, "is_internal_ip": 0, "is_sensitive_path": 1, "http_status": 404}
+def test_raising_an_alert_level_rule_to_quarantine_is_the_models_decision(monkeypatch):
+    # A lone untrusted fetch alerts (0.70); the model, sure, takes it to
+    # quarantine -- allowed, a rule agrees -- and says why.
+    monkeypatch.setattr(ml, "ML_CAN_QUARANTINE", False)
+    probe = {**NOISY, "event_type": "DEPENDENCY_FETCH", "is_untrusted_fetch": 1, "http_status": 200}
     event = scored(probe, ml.Model(DUMP, "v1"))
-    assert event["rule_hits"] == "sensitive_path_probe" and event["recommended_action"] == "block"
+    assert event["rule_hits"] == "untrusted_fetch" and event["recommended_action"] == "quarantine"
     assert event["ml_reason"].startswith("ml: ")
 
 
@@ -148,7 +147,7 @@ def test_compiled_scores_equal_lightgbm():
     np = pytest.importorskip("numpy")
     rng = np.random.default_rng(3)
     x = rng.gamma(1.0, 4.0, size=(3000, len(ml.FEATURES)))
-    y = (x[:, F("failed_logins_5m")] + x[:, F("unique_ports_5m")] > 12).astype(int)
+    y = (x[:, F("failed_builds_5m")] + x[:, F("distinct_exit_codes_5m")] > 12).astype(int)
     booster = lgb.train({"objective": "binary", "num_leaves": 15, "verbose": -1},
                         lgb.Dataset(x, y, feature_name=list(ml.FEATURES)), num_boost_round=50)
     model = ml.Model(booster.dump_model(), "t")
@@ -166,7 +165,7 @@ def test_a_production_size_model_fits_the_budget_many_times_over():
     np = pytest.importorskip("numpy")
     rng = np.random.default_rng(9)
     x = rng.gamma(1.0, 4.0, size=(5000, len(ml.FEATURES)))
-    y = (x[:, F("failed_logins_5m")] * x[:, F("is_night")] + x[:, F("unique_ports_5m")] > 14).astype(int)
+    y = (x[:, F("failed_builds_5m")] * x[:, F("is_night")] + x[:, F("distinct_exit_codes_5m")] > 14).astype(int)
     booster = lgb.train({"objective": "binary", "num_leaves": 15, "verbose": -1, "min_data_in_leaf": 5},
                         lgb.Dataset(x, y, feature_name=list(ml.FEATURES)), num_boost_round=120)
     model = ml.Model(booster.dump_model(), "size")

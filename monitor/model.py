@@ -7,7 +7,7 @@
             here within 5)
   reviewer  the AI reviewer's verdicts over 24 h, its disagreements with the
             pipeline, and the guard's inputs: how many of the active model's
-            own alerts it reviewed, and how many it called benign
+            own alerts it reviewed, and how many it called normal
   labels    what the next training run will learn from
 """
 
@@ -49,7 +49,7 @@ WHERE reviewed_at > now64(3) - INTERVAL 24 HOUR AND confidence >= {confidence:Fl
 # orchestration/ops/training.py guard(), on the active version.
 GUARD = """
 SELECT countIf(why_selected = 'model_alert') AS reviewed,
-       countIf(why_selected = 'model_alert' AND verdict = 'benign' AND confidence >= {confidence:Float64}) AS benign
+       countIf(why_selected = 'model_alert' AND verdict = 'normal' AND confidence >= {confidence:Float64}) AS false_alarms
 FROM watchtower.event_reviews
 WHERE ml_model = {version:String} AND reviewed_at > now64(3) - INTERVAL 24 HOUR"""
 
@@ -57,7 +57,7 @@ LABELS = """
 SELECT source, label, count() AS n FROM watchtower.training_labels GROUP BY source, label"""
 
 HOLDOUT_RATES = ("average_precision", "precision_at_alert", "recall_at_alert", "false_positive_rate_at_alert")
-HOLDOUT_COUNTS = ("rows", "attacks", "normal", "false_positives")
+HOLDOUT_COUNTS = ("rows", "incidents", "normal", "false_positives")
 SHADOW = ("rows", "sources", "candidate_alerts", "candidate_sources", "incumbent_alerts", "incumbent_sources")
 
 
@@ -111,24 +111,24 @@ class ModelLifecycle:
                      .add(last["at"] / 1000))
         f.append(gauge("watchtower_reviewer_disagreements_24h",
                        "Confident reviews in 24 h that disagree with the pipeline (label_changes): "
-                       "an allowed event judged not benign, or a model alert judged benign.")
+                       "a passed event judged not normal, or a model alert judged normal.")
                  .add(int(self.ch.row(DISAGREEMENTS, confidence=REVIEW_MIN_CONFIDENCE)["n"])))
 
         if version:
             g = self.ch.row(GUARD, version=version, confidence=REVIEW_MIN_CONFIDENCE)
             guard = gauge("watchtower_guard_model_alerts_24h",
                           "The active model's own alerts the reviewer judged in 24 h, and how many it "
-                          "called benign. The guard rolls back past its thresholds.")
+                          "called normal (false alarms). The guard rolls back past its thresholds.")
             guard.add(int(g["reviewed"]), kind="reviewed")
-            guard.add(int(g["benign"]), kind="benign")
+            guard.add(int(g["false_alarms"]), kind="false_alarms")
             f.append(guard)
             limits = gauge("watchtower_guard_threshold", "The guard's rollback thresholds "
                            "(orchestration/ops/training.py).")
             limits.add(GUARD_MIN_REVIEWED, kind="min_reviewed")
-            limits.add(GUARD_MAX_FALSE_ALARMS, kind="max_benign_share")
+            limits.add(GUARD_MAX_FALSE_ALARMS, kind="max_false_alarm_share")
             f.append(limits)
 
-        labels = gauge("watchtower_training_labels", "Training labels by source and label (1 attack, 0 benign); "
+        labels = gauge("watchtower_training_labels", "Training labels by source and label (1 incident, 0 normal); "
                        "copies not yet merged count twice.")
         for r in self.ch.rows(LABELS):
             labels.add(int(r["n"]), source=r["source"], label=str(r["label"]))

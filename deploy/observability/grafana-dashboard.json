@@ -132,8 +132,8 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(flink_taskmanager_job_task_operator_watchtower_action_allow[1m]))",
-          "legendFormat": "allow",
+          "expr": "sum(rate(flink_taskmanager_job_task_operator_watchtower_action_ok[1m]))",
+          "legendFormat": "ok",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -150,8 +150,8 @@
           }
         },
         {
-          "expr": "sum(rate(flink_taskmanager_job_task_operator_watchtower_action_block[1m]))",
-          "legendFormat": "block",
+          "expr": "sum(rate(flink_taskmanager_job_task_operator_watchtower_action_quarantine[1m]))",
+          "legendFormat": "quarantine",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
@@ -206,7 +206,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "Data quality between steps (events/min)",
-      "description": "Events flagged at each transformation boundary (etl/core/dq.py). normalize/enrich: doubtful but kept (defaulted severity, no user, unplaced IP, clock off). features/rules: contradictions -- should always be zero. validate: rejected, by reason.",
+      "description": "Events flagged at each transformation boundary (etl/core/dq.py). normalize/enrich: doubtful but kept (defaulted severity, no project, unplaced runner, clock off). features/rules: contradictions -- should always be zero. validate: rejected, by reason.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

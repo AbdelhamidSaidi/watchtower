@@ -1,10 +1,12 @@
 # Watchtower
 
-**A real-time security log pipeline: every event decided in milliseconds, stored for analysis, and a detector that learns from an AI's second opinion.**
+**A real-time build-log pipeline: every event from the build farm decided in milliseconds, stored for analysis, and a detector that learns from an AI's second opinion.**
 
-Watchtower streams security logs through **Kafka**, decides each event as it arrives in **Apache Flink** — rules plus a **LightGBM** model, ~0.2 s from event to stored row — and keeps everything in **ClickHouse** for analysis. **Airflow** runs the batch side: data-quality checks, daily rollups, and an hourly **MLOps loop** in which an LLM (Groq) reviews a sample of the pipeline's decisions, its corrections become training labels, and a new model goes live only if it measures better.
+Watchtower streams the compilation logs of a build farm — the data-center runners that compile, test and publish every application — through **Kafka**, decides each event as it arrives in **Apache Flink** — rules plus a **LightGBM** model, ~0.2 s from event to stored row — and keeps everything in **ClickHouse** for analysis. **Airflow** runs the batch side: data-quality checks, daily rollups, and an hourly **MLOps loop** in which an LLM (Groq) reviews a sample of the pipeline's decisions, its corrections become training labels, and a new model goes live only if it measures better.
 
-Built for the Sekera Services internship *« Conception d'un pipeline de traitement des logs de sécurité avec ClickHouse »*.
+What it watches for is the farm's own trouble: a runner caught in a failure storm, a broken toolchain, an out-of-memory killing spree, a compiler crash, a poisoned build cache, a compile step that suddenly takes ten times as long, a build step that has no business running a miner.
+
+Built for the Sekera Services internship *« Conception d'un pipeline de traitement des logs … avec ClickHouse »*. The project began as a security-log pipeline and was switched to compilation logs; the Kafka topics, ClickHouse tables and schema-registry subject kept their original names (`security-logs`, `security_events`, …) so the plumbing did not have to move.
 
 ---
 
@@ -36,15 +38,19 @@ Built for the Sekera Services internship *« Conception d'un pipeline de traitem
 
 | | |
 |---|---|
-| **Traffic** | a simulated company of 1,780 hosts at 1,000 events/s (Avro, keyed by source IP), with 9 kinds of attack |
-| **Latency** | event created → row stored: **median 194 ms, p95 346 ms** at 1,000 events/s; the decision itself ~5 ms after Kafka |
+| **Traffic** | a simulated build farm of 1,780 runners at 1,000 events/s (Avro, keyed by runner IP), with 9 kinds of incident |
+| **Latency** | event created → row stored, build-farm traffic at 1,000 events/s (10 min, dev machine): **median ~58 ms, p95 ~350–610 ms**; the decision itself p50 4 ms, p95 6–16 ms after Kafka. The earlier security-log run measured median 194 ms, p95 346 ms (before the 50 ms ClickHouse blocks) |
 | **Per-event cost** | ~183 µs in the Flink job with the model (~10 µs of it) — 18% of the 1 ms each event has at 1,000/s; ~5,450 events/s per TaskManager |
-| **Detection** (15 min, 879,721 events) | 29 of 29 attacks caught, 99.3% of attack events blocked, every event decided; 7 of 868,112 normal events wrongly blocked on uninvolved hosts |
+| **Detection** | rules alone. Offline replay (`tools/replay_offline.py`, two 15-minute replays of 900,000 events, 9 kinds): 111 of 111 incidents caught, 0 of 1.76 million normal events flagged on runners with no incident. Live (`make evaluate`, 1,000 events/s, 8 min, 480,381 events, 7 kinds seen): every incident caught, first flag 0–2 s after its first event, coverage 100%. No model yet, so no ML numbers |
 | **Learning loop** | hourly AI review → labels → retraining starts on new labels → promoted only if better → picked up by Flink within 5 min, no restart |
-| **The model, live** | its own alerts: 35 of 35 were real attacks (6 min vs ground truth); ~0.1% of events; adds a few ms at p95 at most |
+| **The model, live** | scored compiled, in-stream, ~10 µs per event; a model trained on the build features has to be produced by the first hourly review + training cycle |
 | **Orchestration** | 6 Airflow DAGs: end-to-end pipeline check (10 min), data quality (hourly), AI review (hourly), training (on new labels + nightly), rollup (daily), detection quality (6-hourly) |
 | **Scaling** | Kubernetes: Flink TaskManagers (5–24 in prod) and Kafka brokers (3–6) autoscale |
-| **Tests** | 85 in the Flink image, 113 in the Airflow image; lint clean |
+| **Tests** | unit, monitor, orchestration and evaluator suites pass locally; the Flink-image suites (`make test-flink`, `make test-airflow`) are the full gate; lint clean |
+
+> **About the numbers.** Latency and detection above were measured live on build-farm traffic on 2026-10-01 (§15). Per-event cost, per-TaskManager throughput and the capacity ceiling were measured on the earlier security-log workload; the path is the same, but they were not re-measured.
+>
+> **Reading `make evaluate`.** The evaluator reads 5 minutes before its window (`--lead-in-minutes`, 0 turns it off) so that a runner whose incident ended just before the window — its rolling windows still carry the evidence — is counted as containment, not as a false positive on an uninvolved runner. Without that lead-in, a 5-minute live window reported 383 "uninvolved" quarantines (0.13%); with it, the same kind of window reports 0. Only events inside the window are counted; the per-incident table can include an incident's lead-in events.
 
 ---
 
@@ -55,12 +61,12 @@ Three layers: an **online path** that decides every event as it arrives, an **an
 ```
  ONLINE (per event, milliseconds)
  ─────────────────────────────────
-  log sources / simulator
-        │  Avro, keyed by source_ip
+  build agents / simulator
+        │  Avro, keyed by runner_ip
         ▼
   Kafka ─ security-logs ──────────────► Flink job (etl/stream/job.py)
                                           decode → validate → normalize → enrich
-                                          → keyBy(source_ip) → dedup → rolling 1m/5m features
+                                          → keyBy(runner_ip) → dedup → rolling 1m/5m features
                                           → rules → LightGBM model (compiled, ~10 µs)
                                           + data-quality counters between every step
                                                 │                     │
@@ -82,7 +88,7 @@ Why each piece — in short (the full reasoning is in [`docs/context.md`](docs/c
 
 - **Kafka** decouples sources from processing, keeps a day of raw events for replays and evaluation, and carries results to ClickHouse.
 - **Flink, not Spark.** The project began on Spark micro-batches: a 20 s trigger meant events waited up to 20 s, and at 1,000/s batches fell behind. Flink processes one event at a time with keyed state; Spark was removed entirely.
-- **ClickHouse** is a columnar OLAP store: billions of rows, sub-second analyst queries. It takes inserts in blocks, so its Kafka engine batches on its side (50 ms) and a ClickHouse outage never back-pressures detection.
+- **ClickHouse** is a columnar OLAP store: billions of rows, sub-second engineer queries. It takes inserts in blocks, so its Kafka engine batches on its side (50 ms) and a ClickHouse outage never back-pressures detection.
 - **Airflow** runs what is scheduled — checks, rollups, the AI review, training — tied to data intervals, with retries, history and backfills. It supervises the stream; it never puts events into batches.
 
 ---
@@ -91,20 +97,20 @@ Why each piece — in short (the full reasoning is in [`docs/context.md`](docs/c
 
 | step | where | what happens |
 |---|---|---|
-| **produce** | `producer/security_log_producer.py` | Avro, Confluent wire format, schema looked up in the registry (never registered by the producer); keyed by `source_ip` so one source stays on one partition |
+| **produce** | `producer/build_log_producer.py` | Avro, Confluent wire format, schema looked up in the registry (never registered by the producer); keyed by `runner_ip` so one runner stays on one partition |
 | **decode** | `etl/core/records.py` | every registered schema version is decodable; unreadable messages → dead-letter with the original bytes |
-| **validate** | `etl/core/records.py` | UUID, timestamp, event type, ports, HTTP status; failures → `rejected_events` with a reason |
+| **validate** | `etl/core/records.py` | UUID, timestamp, event type, exit code, ports, HTTP status, duration; failures → `rejected_events` with a reason |
 | **normalize** | `etl/core/records.py` | one spelling per value (case, whitespace, known severities) |
-| **enrich** | `etl/core/records.py`, `indicators.py` | attack signatures in URLs, scanner user agents, sensitive paths/commands, privilege, internal vs external IP, GeoIP, time of day |
-| **dedup** | `etl/core/processor.py` | a source's last 1,024 event ids (Kafka is at-least-once) |
-| **features** | `etl/core/window.py` | rolling 1- and 5-minute windows per source: failed logins, distinct users/ports/paths, 404s, bytes, commands… O(1) per event |
-| **rules** | `etl/core/rules.py` | 16 rules → `rule_score`, `rule_hits` |
+| **enrich** | `etl/core/records.py`, `indicators.py` | infrastructure-failure signatures in error text (compiler crash, OOM, full disk, checksum mismatch), rogue commands, untrusted fetches, slow steps, cache misses, privilege, internal vs external runner, region, time of day |
+| **dedup** | `etl/core/processor.py` | a runner's last 1,024 event ids (Kafka is at-least-once) |
+| **features** | `etl/core/window.py` | rolling 1- and 5-minute windows per runner: failed builds, distinct projects, OOM kills, slow steps, cache misses, 404s on dependencies, published bytes… O(1) per event |
+| **rules** | `etl/core/rules.py` | 17 rules → `rule_score`, `rule_hits` |
 | **model** | `etl/core/ml.py` | LightGBM, compiled to plain Python → `ml_score`, and `ml_reason` when it changed the decision |
-| **decide** | `etl/core/ml.py` | `final = max(rule score, model score)`; ≥ 0.85 block, ≥ 0.65 alert; the model alone can alert, not block |
+| **decide** | `etl/core/ml.py` | `final = max(rule score, model score)`; ≥ 0.85 `quarantine`, ≥ 0.65 `alert`, else `ok`; the model alone can alert, not quarantine |
 | **store** | `clickhouse/init/03_streaming_ingest.sql` | Kafka engine → `security_events` in 50 ms blocks; unparseable rows → `rejected_events` |
-| **check** | `etl/core/dq.py` | between every step: counters for defaulted fields, unplaced IPs, clock skew, inconsistent windows or decisions |
+| **check** | `etl/core/dq.py` | between every step: counters for defaulted fields, unplaced runners, clock skew, inconsistent windows or decisions |
 
-**Delivery is at-least-once, end to end.** Kafka offsets and every source's state are checkpointed together every 10 s; the sink flushes on checkpoints; ClickHouse commits offsets only after inserting. A replay can repeat rows — `security_events` is a `ReplacingMergeTree`, so they collapse.
+**Delivery is at-least-once, end to end.** Kafka offsets and every runner's state are checkpointed together every 10 s; the sink flushes on checkpoints; ClickHouse commits offsets only after inserting. A replay can repeat rows — `security_events` is a `ReplacingMergeTree`, so they collapse.
 
 All decision logic lives in **`etl/core/`**: plain Python, no Flink imports, tested without a cluster. The Flink job only wires it into operators.
 
@@ -114,18 +120,18 @@ All decision logic lives in **`etl/core/`**: plain Python, no Flink imports, tes
 
 ### Rules (`etl/core/rules.py`)
 
-16 deterministic rules, strongest first:
+17 deterministic rules, strongest first. A rule's score says how sure it is: signatures (wrong in themselves) score high, a lone slow compile step only alerts.
 
 | kind | rules | score |
 |---|---|---|
-| signatures — bad in themselves | `reverse_shell`, `sensitive_command_as_root`, `sqli`, `path_traversal`, `xss`, `sensitive_command`, `scanner_agent`, `sensitive_path_probe` | 0.70–1.00 |
-| behaviour — the source's recent history | `login_after_brute_force`, `brute_force`, `password_spray`, `port_scan`, `lateral_movement`, `web_scan`, `data_exfiltration`, `repeated_attack_signatures` | 0.85–1.00 |
+| signatures — wrong in themselves | `reverse_shell`, `rogue_command_as_root`, `cache_poisoned` (checksum mismatch), `compiler_crash` (internal compiler error), `disk_full`, `rogue_command` (a miner, `curl … \| sh`, credentials read out), `oom_kill`, `untrusted_fetch` (an unofficial mirror, a script as a dependency), `slow_step` | 0.70–1.00 |
+| behaviour — the runner's recent history | `pass_after_failure_storm`, `failure_storm`, `broken_toolchain` (failures across 8+ projects), `oom_kill_storm`, `repeated_slow_steps`, `dependency_not_found_storm`, `artifact_bloat` (250 MB+ published in 5 min), `repeated_failure_signatures` | 0.70–0.90 |
 
-Behavioural rules key on the **source**, so a compromised host's ordinary traffic is blocked with it while it misbehaves (containment — a policy choice, see [`NOTE_TO_SOC_ANALYST.md`](NOTE_TO_SOC_ANALYST.md)).
+The actions are the farm's: `ok` lets the runner carry on, `alert` asks an engineer to look, `quarantine` means *stop scheduling builds on this runner*. Behavioural rules key on the **runner**, so a faulty runner's ordinary builds are quarantined with it while it misbehaves (containment — a policy choice, see [`NOTE_TO_BUILD_ENGINEER.md`](NOTE_TO_BUILD_ENGINEER.md)). Ordinary breakage — a compile error, a failing test, a root container — fires nothing: the code is wrong, not the machine.
 
 ### The model (`etl/core/ml.py`)
 
-A LightGBM classifier on 30 features — the same numbers the rules see. It is **compiled to nested `if` statements** when the job loads it: no library at scoring time, output identical to LightGBM's.
+A LightGBM classifier on 35 features — the same numbers the rules see. It is **compiled to nested `if` statements** when the job loads it: no library at scoring time, output identical to LightGBM's.
 
 | way to score one event (Flink image, 1 row per call) | p50 | p99 |
 |---|---|---|
@@ -135,20 +141,20 @@ A LightGBM classifier on 30 features — the same numbers the rules see. It is *
 
 (100 trees × 15 leaves, `tools/bench_model.py`; the production model, 120 trees, costs ~8 µs p50 / 18 µs p99.)
 
-Policy: `final = max(rule score, model score)`, but **the model alone can only alert** — to block, a rule must agree (`WATCHTOWER_ML_CAN_BLOCK`). When the model changes a decision, `ml_reason` names the features that drove it (e.g. `ml: failed_logins_5m, unique_users_5m`). `WATCHTOWER_ML=off` switches it off without a code change.
+Policy: `final = max(rule score, model score)`, but **the model alone can only alert** — to quarantine, a rule must agree (`WATCHTOWER_ML_CAN_QUARANTINE`). When the model changes a decision, `ml_reason` names the features that drove it (e.g. `ml: failed_builds_5m, unique_projects_5m`). `WATCHTOWER_ML=off` switches it off without a code change.
 
 ### The AI reviewer (`orchestration/ops/review.py`)
 
-An LLM call per event would stall the stream, so the LLM never scores live. Every hour, Groq's **`openai/gpt-oss-safeguard-20b`** — a classifier built to judge content against a policy you write — reviews a sample of the closed hour:
+An LLM call per event would stall the stream, so the LLM never scores live. Every hour, Groq's **`openai/gpt-oss-safeguard-20b`** — a classifier built to judge content against a policy you write, here a build-infrastructure engineer's — reviews a sample of the closed hour. It answers `normal`, `degraded` or `incident`:
 
 | sample | from | a confident disagreement (≥ 80%) becomes |
 |---|---|---|
-| `near_miss` | allowed, the highest model scores | label 1 — an attack the model let through |
-| `unusual` | allowed, the hour's top 0.1% on a behaviour feature | label 1 |
-| `random` | allowed, uniform (served first: the honest miss-rate estimate) | label 1 |
+| `near_miss` | passed (`ok`), the highest model scores | label 1 — an incident the model let through |
+| `unusual` | passed, the hour's top 0.1% on a behaviour feature | label 1 |
+| `random` | passed, uniform (served first: the honest miss-rate estimate) | label 1 |
 | `model_alert` | alerted by the model alone | label 0 — a false alarm to unlearn |
 
-At most 150 events a run, 3,000 a day. Requests are **paginated** to the free tier's 8,000 tokens per minute: pages of ≤ 10 events and ≤ half the minute's budget, a one-minute token ledger, and `Retry-After` honoured. An allowed event judged malicious at ≥ 90% fails the run at once — someone should look now.
+At most 150 events a run, 3,000 a day. Requests are **paginated** to the free tier's 8,000 tokens per minute: pages of ≤ 10 events and ≤ half the minute's budget, a one-minute token ledger, and `Retry-After` honoured. A passed event judged `incident` at ≥ 90% fails the run at once — someone should look now.
 
 ### The learning loop
 
@@ -160,16 +166,16 @@ new AI labels ──► training starts (Airflow asset) ──► candidate mode
    ranking      average precision no lower (holdout the AI never touched)
    false alarms within what chance explains (Poisson 95% margin)
    corrections  wrong on no more of the AI-relabelled events
-   shadow       on the last 6 h of real traffic (≤ 50 events per host): alerts it would
-                raise alone ≤ 0.5% of events, ≤ 1.5× the active model's, on ≤ 1.5× as many hosts
+   shadow       on the last 6 h of real traffic (≤ 50 events per runner): alerts it would
+                raise alone ≤ 0.5% of events, ≤ 1.5× the active model's, on ≤ 1.5× as many runners
           │
           ▼
    ml_model_active ──► Flink loads it within 5 min, no restart
           │
-          ▼  guard: if the AI calls > half of its own alerts benign (≥ 20 in 24 h) → previous model back
+          ▼  guard: if the AI calls > half of its own alerts normal (≥ 20 in 24 h) → previous model back
 ```
 
-**Training labels** keep every attack event and up to 5 normal events per source per hour, each weighted by how many it stands for — every host is represented, and the model still learns the real base rate. (A uniform 2% sample once left remote staff so thin that a model alerted on every VPN user; the per-source sample and the shadow check are the fix — see [`docs/orchestration.md`](docs/orchestration.md) §5.)
+**Training labels** keep every incident event and up to 5 normal events per runner per hour, each weighted by how many it stands for — every runner is represented, and the model still learns the real base rate. (A uniform 2% sample once left the quietest runners so thin that a model alerted on every one of them; the per-runner sample and the shadow check are the fix — see [`docs/orchestration.md`](docs/orchestration.md) §5.)
 
 ---
 
@@ -180,11 +186,11 @@ Airflow 3.3 (`orchestration/dags/`); the work itself is plain Python in `orchest
 | DAG | schedule | does | writes | fails when |
 |---|---|---|---|---|
 | `watchtower_pipeline` | every 10 min | Kafka, registry, ClickHouse → Flink job RUNNING (restarts a stopped one on Kubernetes) → samples the flow → judges extract / transform / load | `pipeline_health` | a service is down, the job is not running, a stage is stalled or behind — **the graph turns red at the broken stage** |
-| `watchtower_data_quality` | hourly | 7 checks on the closed hour: volume, rejected share, missing fields, latency, unmerged copies, block-rate jump, model-score drift (PSI) | `data_quality_checks` | a *fail* check fails (warnings are recorded only) |
-| `watchtower_review` | hourly | collect the simulator's labels; select candidates; **Groq judges them**; learn; alert on sure misses; guard the model | `event_reviews`, `training_labels` | the AI is sure an allowed event was malicious; or the guard rolled a model back |
+| `watchtower_data_quality` | hourly | 7 checks on the closed hour: volume, rejected share, missing fields, latency, unmerged copies, quarantine-rate jump, model-score drift (PSI) | `data_quality_checks` | a *fail* check fails (warnings are recorded only) |
+| `watchtower_review` | hourly | collect the simulator's labels; select candidates; **Groq judges them**; learn; alert on sure misses; guard the model | `event_reviews`, `training_labels` | the AI is sure a passed event was an incident; or the guard rolled a model back |
 | `watchtower_training` | **when the AI adds labels**, and nightly | train LightGBM, evaluate, shadow-check, promote if better | `ml_models`, `ml_model_active` | training errors (a worse model is simply not promoted) |
 | `watchtower_daily` | daily | wait for the day to close → merge away replayed copies → rebuild the day's rollups → reconcile to the event | `daily_summary`, `daily_rule_hits`, `daily_top_sources` | the rollup does not count exactly the day's events |
-| `watchtower_detection_quality` | every 6 h | detection vs the simulator's ground truth, once the pipeline is verified healthy | `detection_quality` | an attack was missed, detection got slow, coverage dropped, or uninvolved hosts were blocked |
+| `watchtower_detection_quality` | every 6 h | detection vs the simulator's ground truth, once the pipeline is verified healthy | `detection_quality` | an incident was missed, detection got slow, coverage dropped, or uninvolved runners were quarantined |
 
 Every check records its result before it can fail, so a broken run keeps its evidence. Full description: [`docs/orchestration.md`](docs/orchestration.md).
 
@@ -194,8 +200,8 @@ Every check records its result before it can fail, so a broken run keeps its evi
 
 | table / view | holds |
 |---|---|
-| `security_events` | every event: fields, indicators, features, rule and model scores, decision, `ingested_at` — `ReplacingMergeTree`, sorted by `(10-min bucket, source_ip, timestamp, event_id)`, bloom filter on `event_id` |
-| `suspicious_events` | alerts and blocks only (materialized view) |
+| `security_events` | every event: fields, indicators, features, rule and model scores, decision, `ingested_at` — `ReplacingMergeTree`, sorted by `(10-min bucket, runner_ip, timestamp, event_id)`, bloom filter on `event_id` |
+| `suspicious_events` | alerts and quarantines only (materialized view) |
 | `rejected_events` | refused messages: reason, schema id, the original bytes (base64), Kafka coordinates |
 | `pipeline_health` | the end-to-end verdict every 10 minutes, per stage |
 | `data_quality_checks` | every hourly check result |
@@ -206,9 +212,9 @@ Every check records its result before it can fail, so a broken run keeps its evi
 | `ml_models`, `ml_model_active` | every trained model (dump + metrics); which one is live |
 | `ml_decisions_hourly`, `ml_model_review` (views) | what each model version did, hour by hour; how it fared under review |
 
-The sort key makes analyst drill-downs cheap — measured on 43M events: one event by id 683 MB → 3 MB read; one source's whole history 1 GB → 5 MB (`make ch-bench`).
+The sort key makes drill-downs cheap — measured on 43M events of the earlier workload: one event by id 683 MB → 3 MB read; one runner's whole history 1 GB → 5 MB (`make ch-bench`).
 
-Schema files: `clickhouse/init/01…05_*.sql`, applied in order by `make ch-migrate` (idempotent).
+Schema files: `clickhouse/init/01…05_*.sql`, applied in order by `make ch-migrate` (idempotent). **An install created before the switch to build logs has the old columns**: see [`docs/operations.md`](docs/operations.md) "Switching an existing install to build logs".
 
 ---
 
@@ -236,7 +242,7 @@ Watchtower/
 ├── docker-compose.yml            dev stack: Kafka, Karapace, ClickHouse, Flink;
 │                                 profiles: sim (producer), airflow (Airflow + Postgres)
 ├── schemas/                      the Avro contract + registry client (stdlib only)
-├── producer/                     the company simulation
+├── producer/                     the build-farm simulation
 ├── etl/
 │   ├── core/                     ENGINE-FREE logic, run per event by Flink:
 │   │                             records, indicators, window, rules, ml, dq, processor
@@ -246,7 +252,7 @@ Watchtower/
 │   ├── dags/                     the six Airflow DAGs
 │   └── ops/                      what they do, plain Python
 ├── clickhouse/
-│   ├── init/                     01 schema, 01b ml columns, 02 views, 03 Kafka intake,
+│   ├── init/                     01 schema, 02 views, 03 Kafka intake,
 │   │                             04 orchestration tables, 05 ML lifecycle
 │   └── config/                   broker macro, dev memory limits
 ├── tools/                        schema CLI, evaluator, query/model/detection benchmarks,
@@ -345,7 +351,7 @@ Then unpause `watchtower_review` and `watchtower_training`. Without a key the re
 make evaluate
 ```
 
-joins the simulator's ground truth (read back from Kafka) to the pipeline's decisions: per attack type, per attack, time to first flag, false positives (split into containment and uninvolved hosts), the model's own alerts, coverage.
+joins the simulator's ground truth (read back from Kafka) to the pipeline's decisions: per incident type, per incident, time to first flag, false positives (split into containment and uninvolved runners), the model's own alerts, coverage.
 
 ### Stop
 
@@ -369,7 +375,7 @@ Keeps every volume (data, checkpoints, Airflow's database).
 | `make evaluate` | detection vs ground truth |
 | `make pipeline-health` | the latest end-to-end verdict from Airflow, stage by stage |
 | `make ch-migrate` | apply `clickhouse/init/*.sql` (idempotent) |
-| `make ch-bench` | benchmark the analyst queries |
+| `make ch-bench` | benchmark the investigation queries |
 | `make test` | every test suite (unit, Flink job, DAGs) |
 | `make lint` | ruff |
 | `make ci` | lint + tests + render the Kubernetes overlays |
@@ -399,14 +405,15 @@ Everything is an environment variable (Kubernetes: the `pipeline-env` ConfigMap;
 | variable | default | meaning |
 |---|---|---|
 | `LOGS_PER_SECOND` | `1000` | the simulator's rate |
-| `WATCHTOWER_BLOCK_THRESHOLD` | `0.85` | score at or above which an event is blocked |
+| `WATCHTOWER_QUARANTINE_THRESHOLD` | `0.85` | score at or above which an event is quarantined |
 | `WATCHTOWER_THRESHOLD` | `0.65` | score at or above which an event is alerted |
 | `WATCHTOWER_ML` | `on` | `off` scores with rules alone |
-| `WATCHTOWER_ML_CAN_BLOCK` | `false` | let the model block without a rule agreeing |
+| `WATCHTOWER_ML_CAN_QUARANTINE` | `false` | let the model quarantine without a rule agreeing |
+| `WATCHTOWER_SLOW_STEP_MS` | `300000` | a compile step slower than this is a `slow_step` |
 | `WATCHTOWER_MODEL_POLL_SECONDS` | `300` | how often Flink checks for a newly promoted model |
 | `WATCHTOWER_ML_MAX_ALERT_SHARE` | `0.005` | shadow check: most events a candidate may alert on alone |
-| `WATCHTOWER_DEDUP_RECENT` | `1024` | event ids each source remembers for dedup |
-| `WATCHTOWER_SOURCE_IDLE_MS` | 15 min | a silent source is forgotten after this |
+| `WATCHTOWER_DEDUP_RECENT` | `1024` | event ids each runner remembers for dedup |
+| `WATCHTOWER_SOURCE_IDLE_MS` | 15 min | a silent runner is forgotten after this |
 | `WATCHTOWER_CHECKPOINT_INTERVAL_MS` | `10000` | Flink checkpoint interval |
 | `WATCHTOWER_SYNTHETIC_TRAFFIC` | `true` in dev | `false` on real logs: no ground truth, no simulator labels |
 | `GROQ_MODEL` | `openai/gpt-oss-safeguard-20b` | the reviewer's model |
@@ -460,7 +467,7 @@ make smoke ENV=staging
 
 | suite | runs in | proves |
 |---|---|---|
-| `tests/unit` | Flink test image | every per-event stage and reject reason; each rule; the compiled model equals LightGBM and stays inside its time budget; data-quality checks; secrets handling; the wire format |
+| `tests/unit` | Flink test image | every per-event stage and reject reason; each rule; the simulator's nine incident kinds all caught and no healthy runner flagged; the compiled model equals LightGBM and stays inside its time budget; data-quality checks; secrets handling; the wire format |
 | `tests/flink` | Flink test image | the real job on a local Flink mini-cluster: operators, keyed state, side outputs, both execution modes |
 | `tests/orchestration` | Airflow test image | the DAGs parse and are wired as documented; checks, rollups, the pipeline verdict; training, the gate and shadow check; the paginated reviewer against a stand-in Groq; the evaluator |
 
@@ -482,14 +489,17 @@ Measured on the development machine (8 GB RAM, Docker VM 3.8 GB) — details in 
 
 | | result |
 |---|---|
-| end to end at 1,000 events/s (24 min) | median 194 ms, p95 346 ms; 66–84 ms median with 50 ms ClickHouse blocks and free memory |
-| decision latency (Kafka → decided) | ~5 ms |
+| end to end at 1,000 events/s, build logs (10 min, 2026-10-01) | median 51–71 ms (≈58), p95 348–613 ms, p99 544–1,009 ms, max 610–1,456 ms; 998 events/s stored |
+| end to end at 1,000 events/s, security logs (24 min, earlier) | median 194 ms, p95 346 ms |
+| decision latency (Kafka → decided), build logs | p50 4 ms, p95 6–16 ms (two samples at ~175–185 ms), max up to 290 ms |
 | per event in Flink | ~173 µs rules only, ~183 µs with the model |
 | one TaskManager | ~4,100 events/s from Kafka (rules only), ~5,450/s estimated with the model on the detection code alone |
 | this machine | ~1,000 events/s sustained with low latency, ~1,200 maximum — the limit is the Docker VM's memory, not the job |
-| queries after the table relayout | 20–600× less data read for analyst drill-downs |
+| queries after the table relayout | 20–600× less data read for drill-downs |
 
-At 1,000 events/s each event has 1 ms; detection uses ~18% of it on one core.
+At 1,000 events/s each event has 1 ms; detection uses ~18% of it on one core (earlier measurement).
+
+On the 2026-10-01 run the Kafka backlog rose and drained repeatedly between ~400 and ~9,800 events and never grew. **The Docker VM was the constraint**: available memory 540–850 MB and its 1 GB of swap full from about 13:47, ClickHouse at 1.35–1.68 GB. CPU: Flink TaskManager ~40–60% of a core (spikes to 136%), ClickHouse 27–80% (one 180% burst), Kafka 12–38%. The p95 tail is far above the job's own 6–16 ms, so it sits in the ClickHouse insert and Kafka hops, not in detection.
 
 ---
 
@@ -497,7 +507,7 @@ At 1,000 events/s each event has 1 ms; detection uses ~18% of it on one core.
 
 - Secrets are generated locally (`make secrets`), never committed, never written into images, manifests or environment variables: containers read mounted files. `make secrets` never overwrites; rotating is deliberate.
 - The Airflow UI requires a login (generated password); Kubernetes RBAC limits Airflow to restarting one FlinkDeployment.
-- **The AI reviewer sends event details to a third party (Groq)** — source IPs, usernames, URL paths, commands of up to 3,000 events a day. Confirm this is acceptable under your data policy before setting the key on real logs.
+- **The AI reviewer sends event details to a third party (Groq)** — runner IPs, project names, dependency URLs, compiler command lines and error text of up to 3,000 events a day. Confirm this is acceptable under your data policy before setting the key on real logs.
 - Not yet: TLS and authentication on Kafka and ClickHouse, a secrets manager, multi-user Airflow — see [`docs/prod-readiness.md`](docs/prod-readiness.md) Phase 4.
 
 ---
@@ -514,17 +524,17 @@ At 1,000 events/s each event has 1 ms; detection uses ~18% of it on one core.
 | Groq HTTP 429 | the tokens-per-minute limit; set `GROQ_TOKENS_PER_MINUTE` to your plan's value |
 | an Airflow DAG is missing from the UI | an import error in the DAG file: `make test-airflow` shows it |
 | a backfill does not run | the DAG is paused; backfill runs of a paused DAG wait |
-| the model alerts on a whole group of hosts | roll back (`INSERT INTO watchtower.ml_model_active (version, reason) VALUES ('lgbm-…', 'rollback')`) or `WATCHTOWER_ML=off`; the hourly review's guard does it automatically when the AI calls most of its alerts benign |
+| the model alerts on a whole group of runners | roll back (`INSERT INTO watchtower.ml_model_active (version, reason) VALUES ('lgbm-…', 'rollback')`) or `WATCHTOWER_ML=off`; the hourly review's guard does it automatically when the AI calls most of its alerts normal |
 
 ---
 
 ## 18. Known limitations
 
-- **Simulated traffic.** The model learns from the simulator's ground truth plus the AI's corrections; on real logs, analysts' verdicts must become labels before it should block.
+- **Simulated traffic.** The model learns from the simulator's ground truth plus the AI's corrections; on real build logs, engineers' verdicts must become labels before it should quarantine.
 - **Kubernetes not run on a real cluster** — manifests render and validate; autoscaling at scale is designed, not measured. 10,000 events/s is a projection from one TaskManager.
 - **Single ClickHouse replica**; no backups yet. Replication (2 replicas + 3 ClickHouse Keeper nodes on separate machines) is production task 7.
 - **The development machine** cannot run the whole stack, Airflow and the hourly jobs together for long: ClickHouse is killed for memory.
-- **Detection gaps**: slow attacks (windows are 1 and 5 minutes); credential stuffing (features are per source IP, not per user).
+- **Detection gaps**: slow incidents (windows are 1 and 5 minutes); a bad commit that fails on many runners at once (features are per runner, so each sees only a few failures — a per-project view is not built).
 - **Alerts notify no one** until an Alertmanager receiver and Airflow failure callbacks are configured.
 
 ---
@@ -539,4 +549,4 @@ At 1,000 events/s each event has 1 ms; detection uses ~18% of it on one core.
 | [`docs/operations.md`](docs/operations.md) | runbook: environments, tests, deploys, scaling, migrations, secrets, alerts, recovery |
 | [`docs/capacity-report.md`](docs/capacity-report.md) | load tests on the development machine |
 | [`docs/prod-readiness.md`](docs/prod-readiness.md) | the 38 tasks between this and production |
-| [`NOTE_TO_SOC_ANALYST.md`](NOTE_TO_SOC_ANALYST.md) | for the analyst: what each rule means, reading the columns, tuning, investigating an alert |
+| [`NOTE_TO_BUILD_ENGINEER.md`](NOTE_TO_BUILD_ENGINEER.md) | for the build engineer: what each rule means, reading the columns, tuning, investigating an alert |

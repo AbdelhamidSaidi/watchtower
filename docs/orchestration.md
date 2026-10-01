@@ -21,7 +21,7 @@ Airflow brings what cron would not: runs tied to a **data interval** (the
 hour or day they cover), retries, a record of every run, dependencies
 between steps, and **backfills** — rebuild any past day with one command.
 
-*Added 2026-09-27. Airflow 3.3.2, Postgres 18.6 for its metadata.*
+*Added 2026-09-27. Airflow 3.3.2, Postgres 18.6 for its metadata. On 2026-10-01 the pipeline moved from security logs to build-farm (compilation) logs: the machinery below is unchanged, the checks, rules and the reviewer's policy are about builds now. The measured results in §1 and §5 are from the earlier workload -- see the notes there.*
 
 ---
 
@@ -32,8 +32,8 @@ between steps, and **backfills** — rebuild any past day with one command.
 | `watchtower_pipeline` | every 10 min | services → stream_job → sample_flow → extract, transform, load → record → verdict | `pipeline_health` | a service is down, the stream job is not running, or a stage is stalled or behind |
 | `watchtower_data_quality` | hourly, for the hour just closed | 6 checks in parallel → record → gate | `data_quality_checks` | a **fail** check fails |
 | `watchtower_daily` | daily, for the UTC day just closed | day_closed → deduplicate → summarize → reconcile | `daily_summary`, `daily_rule_hits`, `daily_top_sources` | the summary does not count exactly the day's events |
-| `watchtower_detection_quality` | every 6 h (:15) | pipeline_healthy → evaluate → assess → record → gate | `detection_quality` | an attack was missed, detection got slow, coverage dropped, or uninvolved hosts were blocked |
-| `watchtower_review` | hourly, for the hour just closed | collect_labels, select → judge (Groq) → learn, urgent, guard | `training_labels`, `event_reviews` | the reviewer is ≥ 90% sure an **allowed** event was malicious; or the guard rolled a model back |
+| `watchtower_detection_quality` | every 6 h (:15) | pipeline_healthy → evaluate → assess → record → gate | `detection_quality` | an incident was missed, detection got slow, coverage dropped, or uninvolved runners were quarantined |
+| `watchtower_review` | hourly, for the hour just closed | collect_labels, select → judge (Groq) → learn, urgent, guard | `training_labels`, `event_reviews` | the reviewer is ≥ 90% sure a **passed** (`ok`) event was an incident; or the guard rolled a model back |
 | `watchtower_training` | **when the reviewer adds labels**, and nightly 02:30 UTC | train_and_promote | `ml_models`, `ml_model_active` | training errors (a model that is not better is simply not promoted) |
 
 Tables: `clickhouse/init/04_orchestration.sql`, `05_ml.sql`.
@@ -51,7 +51,7 @@ Tables: `clickhouse/init/04_orchestration.sql`, `05_ml.sql`.
              watchtower_training  <── starts at once ── training_labels <─┘ confident
              (+ nightly)               (asset)                              disagreements
                          │
-             guard: the AI calls most of v(n+1)'s own alerts benign -> back to v(n)
+             guard: the AI calls most of v(n+1)'s own alerts normal -> back to v(n)
 ```
 
 **Speed.** The model adds ~10 µs per event (120 trees, compiled; p99
@@ -64,14 +64,15 @@ events, so it samples, at most 150 a run and 3,000 a day:
 
 | sample | from | a confident verdict that disagrees becomes |
 |---|---|---|
-| `near_miss` | allowed, the highest model scores | label 1: an attack the model let through |
-| `unusual` | allowed, the hour's top 0.1% on a behaviour feature | label 1 |
-| `random` | allowed, uniform — served first, so the miss-rate estimate stays honest | label 1 |
+| `near_miss` | passed (`ok`), the highest model scores | label 1: an incident the model let through |
+| `unusual` | passed, the hour's top 0.1% on a behaviour feature | label 1 |
+| `random` | passed, uniform — served first, so the miss-rate estimate stays honest | label 1 |
 | `model_alert` | alerted by the **model alone** (no rule fired) | label 0: a false alarm the model must unlearn |
 
 The AI is Groq's `openai/gpt-oss-safeguard-20b` (`GROQ_MODEL`), a
 classifier built to judge content against a policy you write — here, the
-SOC review policy in `orchestration/ops/review.py` — with
+build-infrastructure review policy in `orchestration/ops/review.py` (verdicts
+`normal` / `degraded` / `incident`) — with
 `reasoning_effort=medium`, no streaming: a batch job needs the answer,
 not the tokens as they come.
 
@@ -91,13 +92,13 @@ the disagreements. At ≥ 80% confidence a disagreement becomes a label,
 weighted at half a typical sampled event — a second opinion, not an
 oracle — and marks the
 `watchtower_training_labels` asset updated, which **starts a retraining
-at once**. At ≥ 90% and *malicious* on an allowed event, the run fails:
+at once**. At ≥ 90% and *incident* on a passed event, the run fails:
 someone should look now. Without a Groq key the review is skipped; the
 simulator's labels are still collected, and the nightly run still trains.
 
 **The guard.** A promoted model is watched through the reviewer's eyes: if
 more than half of its own alerts in 24 h (at least 20 reviewed) are
-judged benign, the previous model is promoted back and the review run
+judged normal, the previous model is promoted back and the review run
 fails, so someone sees it.
 
 **OLAP over the model** (ClickHouse views, `05_ml.sql`):
@@ -105,7 +106,7 @@ fails, so someone sees it.
 ```sql
 -- what each model did, hour by hour
 SELECT * FROM watchtower.ml_decisions_hourly ORDER BY hour DESC, ml_model LIMIT 24;
--- how each model fares under review: false alarms, missed attacks
+-- how each model fares under review: false alarms, missed incidents
 SELECT * FROM watchtower.ml_model_review ORDER BY hour DESC LIMIT 24;
 ```
 
@@ -119,13 +120,14 @@ labels, and nightly. It uses 14 days of labels — the simulator's ground
 truth, collected hourly from Kafka, plus the reviewer's confident
 corrections — joined to the features the pipeline stored.
 
-*Labels, sampled per source.* Every attack event is kept. Normal events
-are ~97% of traffic, so at most 5 per source per hour are kept (a
-reservoir sample), each weighted by how many of that source's events it
-stands for. A uniform 2% sample was tried first and left quiet hosts —
-the remote staff — so thin that a model learned "external IP + data
-volume" as an attack and alerted on every VPN user; per source, every
-host is in the data, and the weights still add up to the real traffic.
+*Labels, sampled per runner.* Every incident event is kept. Normal events
+are ~97% of traffic, so at most 5 per runner per hour are kept (a
+reservoir sample), each weighted by how many of that runner's events it
+stands for. A uniform 2% sample was tried first (on the earlier security
+workload) and left the quiet hosts — the remote staff — so thin that a model
+learned "external IP + data volume" as an incident and alerted on every VPN
+user; per runner, every runner is in the data, and the weights still add up to
+the real traffic.
 The sample is seeded by the hour it covers, so a re-run or backfill of an
 hour writes exactly the same rows — `training_labels` folds them — and
 never adds a second sample that would double that hour's weight.
@@ -141,10 +143,10 @@ model:
 | ranking | the holdout | average precision no lower (within 0.005) |
 | false alarms | the holdout's normal events | no more than chance explains: the active model's count plus a 95% Poisson margin (0 → up to 4.9, 10 → 18.1) |
 | corrections | events the reviewer relabelled | wrong on no more of them than the active model |
-| **shadow** | up to 20,000 real events from the last 6 hours, at most 50 per source (every host represented) | alerts it would raise on its own (no rule behind them): ≤ 0.5% of events, ≤ 1.5× the active model's, **on ≤ 1.5× as many hosts** |
+| **shadow** | up to 20,000 real events from the last 6 hours, at most 50 per runner (every runner represented) | alerts it would raise on its own (no rule behind them): ≤ 0.5% of events, ≤ 1.5× the active model's, **on ≤ 1.5× as many runners** |
 
 The shadow check scores real traffic the way the stream would, so a
-model that would flood the SOC is refused before it goes live, not
+model that would flood the on-call is refused before it goes live, not
 rolled back after. The model is sized for the stream (≤ 120 trees × 15
 leaves: ~10 µs per event, `tools/bench_detection.py`).
 
@@ -209,10 +211,10 @@ one closed hour at a time (`orchestration/ops/quality.py`):
 |---|---|---|---|
 | `volume` | fail | ≥ 1 event stored | an empty hour means the stream stopped |
 | `rejected_share` | fail | ≤ 1% of messages refused | a producer or schema problem |
-| `missing_identity` | fail | no event without `source_ip` / `event_type` | detection is keyed on them |
+| `missing_identity` | fail | no event without `runner_ip` / `event_type` | detection is keyed on them |
 | `latency_p95_ms` | warn | p95 event → row ≤ 2 s | a slow hour the alert may have missed |
 | `duplicate_share` | warn | ≤ 1% replay copies not yet merged | many means the job keeps restarting |
-| `block_share_vs_7d` | warn | block share ≤ 5× the trailing week | an attack wave, or a rule gone wrong |
+| `quarantine_share_vs_7d` | warn | quarantine share ≤ 5× the trailing week | an incident wave (a bad commit, a registry outage), or a rule gone wrong |
 
 Every result is recorded, passed or not; **warn** results never fail the
 run. Adding a check is one `Check(...)` entry — a name, a severity, a
@@ -244,17 +246,17 @@ Runs `tools/evaluate_detection.py` over the last 15 minutes (a
 **Trigger DAG w/ config** `{"minutes": N}` changes it) and judges the
 report (`orchestration/ops/detection.py`):
 
-| threshold | value | measured, 1,000 events/s, 15 min |
+| threshold | value | measured (earlier security workload), 1,000 events/s, 15 min |
 |---|---|---|
 | coverage (events in Kafka with a decision) | ≥ 99.9% | 100% |
-| attacks never flagged | 0 | 0 of 29 |
-| median time from an attack's first event to its first flag (new sources) | ≤ 5 s | 0.4–1.6 s per attack |
-| normal events blocked on hosts that were **not** attacking | ≤ 0.01% | 0.0008% (7 of 868,112) |
+| incidents never flagged | 0 | 0 of 29 |
+| median time from an incident's first event to its first flag (new sources) | ≤ 5 s | 0.4–1.6 s per incident |
+| normal events quarantined on runners that were **not** affected | ≤ 0.01% | 0.0008% (7 of 868,112) |
 
-Deliberately **not** gated: the share of attack *events* flagged. A
-behavioural rule needs its first few events (7 for lateral movement, 19 for
-a password spray) before it can fire, so that share depends on the mix of
-attacks in the window: the first scheduled run held two small attacks and
+Deliberately **not** gated: the share of incident *events* flagged. A
+behavioural rule needs its first few events (20 for a failure storm, 8 projects
+for a broken toolchain) before it can fire, so that share depends on the mix of
+incidents in the window: the first scheduled run held two small incidents and
 came out at 91.9% with both caught within 1.5 s. It is recorded in the
 table, not used to fail the run.
 
@@ -368,13 +370,15 @@ manifest or an environment variable.
 
 ## 5. First runs (dev, 2026-09-27)
 
+*These runs, and the learning cycles below, happened on the earlier security-log workload (hostile IPs, port scans, VPN users). They are kept as evidence of how the machinery behaved -- the gate, the shadow check, the guard, the pagination -- and have not been repeated on build-farm traffic.*
+
 | run | result |
 |---|---|
 | data quality, 14:00–15:00 | 5 of 6 checks passed; **`latency_p95_ms` warned at 56 s**. Correct: that hour held the evaluator's Kafka read (latency spiked to 16–30 s) and the events left undecided when the stack was stopped, decided at restart |
 | daily, backfill of 2026-09-24 | 2,144,887 events summarized = 2,144,887 stored; top sources the four hostile IPs and one compromised workstation |
 | daily, 2026-09-26 (no data) | passed: nothing to fold, 0 = 0 |
-| detection quality, scheduled | failed on the then-gate "≥ 95% of attack events flagged" (91.9%, two attacks, both caught) — the reason that gate was replaced (§1) |
-| detection quality, manual, 10 min | passed: 29,493 events, 6/6 attacks caught, median first flag 1.02 s, coverage 100%, no uninvolved host blocked |
+| detection quality, scheduled | failed on the then-gate "≥ 95% of incident events flagged" (91.9%, two incidents, both caught) — the reason that gate was replaced (§1) |
+| detection quality, manual, 10 min | passed: 29,493 events, 6/6 incidents caught, median first flag 1.02 s, coverage 100%, no uninvolved host quarantined |
 
 Login with the generated password works; a wrong one gets HTTP 401.
 
@@ -386,11 +390,11 @@ Login with the generated password works; a wrong one gets HTTP 401.
 | Groq, first calls | 403 (firewall: Python's default User-Agent), then 429 (8,000 tokens/min) — fixed by a User-Agent and paginated requests |
 | review of 15:00–16:00 | 94 events judged; 3 model-only alerts on a partner's sync traffic judged benign at 95% → 3 "false alarm" labels → retraining started by itself (asset) |
 | retraining, old gate | candidate fixed the 3 (0.79–0.85 → 0.00) but was refused: 2 false alarms vs 0 on 1,496 normal holdout events — noise. Gate changed to a statistical margin |
-| retraining, new gate | promoted: the active model had fallen to **77.8%** of attacks at the alert line on the newer hours; the new one caught **99.98%** |
+| retraining, new gate | promoted: the active model had fallen to **77.8%** of incidents at the alert line on the newer hours; the new one caught **99.98%** |
 | that model, live | **2.1% of events alerted on by the model alone — all remote-staff VPN hosts.** A uniform 2% label sample had left them out; the holdout could not see it |
 | fix | labels sampled per source; a **shadow check** on the newest hour of real traffic added to the gate |
 | retraining, per-source labels + shadow | promoted: 14 vs 17 model-only alerts on 20,000 recent events; 0 of the reviewer's 13 relabelled events wrong (4 before) |
-| that model, live, 66,624 events | **0.12%** model-only alerts; **none on remote staff** after the first 3 minutes (the restart's replay). The rest: port scans from attacker IPs and internal port scans / SSH — flagged before a rule could fire |
+| that model, live, 66,624 events | **0.12%** model-only alerts; **none on remote staff** after the first 3 minutes (the restart's replay). The rest: port scans from culprit IPs and internal port scans / SSH — flagged before a rule could fire |
 
 ClickHouse was killed for memory twice that day (17:27, 19:07), each time
 with the whole stack, Airflow and the hourly jobs running on the 3.8 GB
@@ -415,7 +419,7 @@ no restart policy in `docker-compose.yml`. They have `unless-stopped` now
   bounded run of the Flink job over those Kafka offsets, launched from
   Airflow; not built yet.
 - **The model learns the simulator** — its labels are the producer's ground
-  truth and the reviewer's corrections. On real traffic, analysts' verdicts
-  must become labels before it can be trusted to block.
+  truth and the reviewer's corrections. On real traffic, engineers' verdicts
+  must become labels before it can be trusted to quarantine.
 - **Tasks share the scheduler's pod.** Fine for SQL; a heavier task would
   want the KubernetesExecutor, one pod per task.

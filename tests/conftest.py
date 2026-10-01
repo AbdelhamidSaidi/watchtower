@@ -54,9 +54,9 @@ def make_event(**overrides):
     event.update({
         "event_id": str(uuid.uuid4()),
         "timestamp": "2026-09-20T14:00:00.123456+00:00",
-        "source_ip": "192.168.1.50",
-        "user": "alice",
-        "event_type": "LOGIN_SUCCESS",
+        "runner_ip": "192.168.1.50",
+        "project": "payments-api",
+        "event_type": "BUILD_SUCCESS",
         "hostname": "ws-050",
         "severity": "INFO",
         "scenario": "normal",
@@ -66,13 +66,15 @@ def make_event(**overrides):
 
 
 def v1_schema_json():
-    """The schema as it was before v2 -- to prove old messages still decode."""
+    """A narrower, older schema -- the identity of the event and little else --
+    to prove messages written before the context fields existed still decode."""
     schema = json.loads(load_local_schema())
-    v2 = {"log_source", "outcome", "session_id", "dest_ip", "dest_port", "protocol",
-          "auth_method", "http_method", "url_path", "http_status", "user_agent",
-          "bytes_sent", "response_time_ms", "process_name", "process_id",
-          "parent_process", "process_uid", "file_path", "file_operation"}
-    schema["fields"] = [f for f in schema["fields"] if f["name"] not in v2]
+    later = {"log_source", "outcome", "build_id", "dest_ip", "dest_port", "protocol",
+             "triggered_by", "http_method", "url_path", "http_status", "user_agent",
+             "bytes_sent", "response_time_ms", "process_name", "process_id",
+             "parent_process", "process_uid", "step", "file_path", "duration_ms",
+             "peak_memory_mb", "cache_status", "error_message"}
+    schema["fields"] = [f for f in schema["fields"] if f["name"] not in later]
     return json.dumps(schema)
 
 

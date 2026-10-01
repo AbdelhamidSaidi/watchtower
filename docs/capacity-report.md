@@ -1,5 +1,12 @@
 # Watchtower — capacity test report
 
+> **Run on the earlier workload.** This test was run on 2026-09-25, when the
+> events were security logs; the "detection" row and the rule names in it are
+> from that run. On 2026-10-01 the events became build-farm logs -- same
+> path, a different event shape (about the same number of fields and rolling
+> counters). The throughput and latency figures should carry over; they have
+> not been re-measured.
+
 **Date:** 2026-09-25 · **Environment:** dev (docker compose) on an 8 GB Mac,
 Docker VM with 8 vCPUs and 3.8 GB RAM (1 GB swap) · **Tool:**
 `tools/load_test.py` (raw results: `load_test_results*.json` in the session
@@ -26,7 +33,7 @@ Flink (1 JobManager, 1 TaskManager, 1 slot) → Kafka `security-events-scored`
 
 - Load from **two simulator containers** (so one Python producer is not the
   ceiling), realistic traffic: 1,780+ hosts, normal activity plus all nine
-  attack types.
+  incident types of the time.
 - Step test: 1,000 → 2,000/s, then 1,200 / 1,400 / 1,600 / 1,800 / 2,000,
   4 minutes per step, stopping after two failing steps. Then **10-minute
   confirmation runs** at 1,200 and 1,000/s, each from a clean restart.
@@ -89,7 +96,7 @@ latency is not dependable.
 | ClickHouse | 9 inserts/s, 125 merges/min, 9 active parts, 0 sink parse errors |
 | CPU (average) | TaskManager 129%, ClickHouse 78%, Kafka 33%, simulators 64%, JobManager 9% |
 | memory (peak) | ClickHouse 1.55 GB, TaskManager 1.06 GB, Kafka 0.34 GB, JobManager 0.32 GB |
-| detection (10 min) | 576,843 allow · 16,654 block; top rules: brute_force 8,535, password_spray 8,155, repeated_attack_signatures 6,316, web_scan 4,483, login_after_brute_force 3,329, scanner_agent 3,019, port_scan 2,314, lateral_movement 1,535, sqli 661, sensitive_command_as_root 545 |
+| detection (10 min) | 576,843 allow · 16,654 block; top rules: brute_force 8,535, password_spray 8,155, repeated_incident_signatures 6,316, web_scan 4,483, login_after_brute_force 3,329, scanner_agent 3,019, port_scan 2,314, lateral_movement 1,535, sqli 661, sensitive_command_as_root 545 |
 
 ## Where the ceiling comes from
 

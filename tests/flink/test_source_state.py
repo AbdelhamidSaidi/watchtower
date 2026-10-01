@@ -92,7 +92,7 @@ class Runtime:
 
 
 class Ctx:
-    def __init__(self, key="45.134.26.7"):
+    def __init__(self, key="10.0.12.21"):
         self.key = key
         self.now = 0
         self.timers = set()
@@ -116,7 +116,7 @@ class Ctx:
 
 def event(seconds, **kw):
     e = {k: v for k, v in make_event(
-        source_ip="45.134.26.7", event_type="LOGIN_FAILURE",
+        runner_ip="10.0.12.21", event_type="BUILD_FAILURE",
         timestamp=(T0 + timedelta(seconds=seconds)).isoformat(), **kw).items() if k != "scenario"}
     assert reject_reason(e) is None
     e = enrich(normalize(e))
@@ -163,13 +163,13 @@ def test_an_idle_source_is_cleared_completely(op):
     fn.on_timer(ctx.now + IDLE_MS + MIN, ctx)
     assert rt.states["window_summary"].value() is None
     assert not rt.states["window_records"]
-    assert not any(rt.states[f"window_{k}"] for k in ("users", "ports", "paths"))
+    assert not any(rt.states[f"window_{k}"] for k in ("projects", "codes", "paths"))
 
     # and it starts over cleanly
     ctx.now += IDLE_MS + 2 * MIN
     import json
     row = json.loads(feed(fn, ctx, event(10_000))[0])
-    assert row["failed_logins_5m"] == 1
+    assert row["failed_builds_5m"] == 1
 
 
 def test_an_early_timer_does_not_clear_an_active_source(op):
@@ -208,7 +208,7 @@ def test_idle_checks_are_spread_over_the_minute_not_on_its_boundary():
     now = 1_790_000_000_000
     offsets = {_idle_check_at(now, f"10.0.{i // 250}.{i % 250}") % TIMER_BUCKET_MS for i in range(1780)}
     assert len(offsets) > 1500
-    for key in ("1.2.3.4", "45.134.26.7"):
+    for key in ("1.2.3.4", "10.0.12.21"):
         at = _idle_check_at(now, key)
         assert now + IDLE_MS < at <= now + IDLE_MS + TIMER_BUCKET_MS
         # stable: same key, same minute -> same timer (so timers coalesce)

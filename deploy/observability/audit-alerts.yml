@@ -15,14 +15,14 @@ groups:
           summary: The audit exporter is not answering
           description: Accuracy, latency and model panels go blank. docker compose logs monitor
 
-      - alert: AttackMissed
-        expr: sum(increase(watchtower_attacks_total{outcome="missed"}[15m])) > 0
+      - alert: IncidentMissed
+        expr: sum(increase(watchtower_incidents_total{outcome="missed"}[15m])) > 0
         labels: {severity: critical}
         annotations:
-          summary: "{{ $value | humanize }} attack(s) ended without a single flag in 15 min"
+          summary: "{{ $value | humanize }} incident(s) ended without a single flag in 15 min"
           description: >-
-            An attack ran to its end and every one of its events was
-            allowed. Which: watchtower_attacks_total{outcome="missed"} by
+            An incident ran to its end and every one of its events was
+            passed. Which: watchtower_incidents_total{outcome="missed"} by
             scenario, on the audit dashboard.
 
       - alert: EventsUndecided
@@ -45,17 +45,17 @@ groups:
             Over the 2 s budget. If the VM is swapping (VmSwapping) that is
             the cause; otherwise compare Kafka -> decision (StreamLatencyHigh).
 
-      - alert: UninvolvedHostsBlocked
+      - alert: UninvolvedRunnersQuarantined
         expr: >-
-          sum(increase(watchtower_normal_blocked_total{host="uninvolved"}[1h]))
+          sum(increase(watchtower_normal_quarantined_total{host="uninvolved"}[1h]))
           / clamp_min(sum(increase(watchtower_detector_events_total{detector="final",truth="normal"}[1h])), 1)
           > 0.0001
         labels: {severity: warning}
         annotations:
-          summary: "{{ $value | humanizePercentage }} of normal events blocked on hosts that were not attacking"
+          summary: "{{ $value | humanizePercentage }} of normal events quarantined on runners that were not affected"
           description: >-
             The detection-quality DAG's threshold (orchestration/ops/detection.py).
-            Blocks on a host that WAS attacking are containment, not counted.
+            Quarantines of a runner that WAS affected are containment, not counted.
 
       - alert: ModelAlertsMostlyWrong
         expr: >-

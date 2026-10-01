@@ -19,32 +19,34 @@ import json
 import math
 import os
 
-from core.rules import BLOCK_THRESHOLD, SUSPICIOUS_THRESHOLD, action_for
+from core.rules import QUARANTINE_THRESHOLD, SUSPICIOUS_THRESHOLD, action_for
 
-# The model alone may raise an event to `alert`; to `block`, a rule must
-# agree -- a block the model cannot explain in rule terms is one an analyst
-# cannot defend. Set true once the model has earned it.
-ML_CAN_BLOCK = os.getenv("WATCHTOWER_ML_CAN_BLOCK", "false").lower() == "true"
-_BELOW_BLOCK = BLOCK_THRESHOLD - 1e-4
+# The model alone may raise an event to `alert`; to `quarantine`, a rule must
+# agree -- pulling a runner out of the farm on a score nobody can explain in
+# rule terms is one an engineer cannot defend. Set true once the model has
+# earned it.
+ML_CAN_QUARANTINE = os.getenv("WATCHTOWER_ML_CAN_QUARANTINE", "false").lower() == "true"
+_BELOW_QUARANTINE = QUARANTINE_THRESHOLD - 1e-4
 
 # The model's input, in order. Fields the event already carries after
 # enrich + features; changing this list means retraining.
 FEATURES = (
-    "failed_logins_1m", "failed_logins_5m", "unique_users_5m", "requests_1m",
-    "port_scan_count_5m", "unique_ports_5m", "commands_executed_5m", "login_frequency",
-    "sensitive_commands_5m", "attack_signatures_5m", "http_errors_5m", "http_404_1m",
-    "distinct_paths_5m", "bytes_sent_5m",
-    "is_internal_ip", "is_night", "is_attack_signature", "is_scanner_agent",
-    "is_sensitive_path", "is_sensitive_command", "is_privileged",
-    "http_status", "target_port", "dest_port", "bytes_sent", "response_time_ms",
-    "is_login_failure", "is_login_success", "is_command", "is_http",
+    "failed_builds_1m", "failed_builds_5m", "unique_projects_5m", "events_1m",
+    "oom_kills_5m", "distinct_exit_codes_5m", "compile_steps_5m", "build_frequency",
+    "rogue_commands_5m", "failure_signatures_5m", "http_errors_5m", "dependency_404_1m",
+    "distinct_artifacts_5m", "published_bytes_5m", "slow_steps_5m", "cache_misses_5m",
+    "is_internal_ip", "is_night", "is_failure_signature", "is_untrusted_fetch",
+    "is_rogue_command", "is_privileged", "is_slow_step", "is_cache_miss",
+    "http_status", "exit_code", "dest_port", "bytes_sent", "response_time_ms",
+    "duration_ms", "peak_memory_mb",
+    "is_build_failure", "is_build_success", "is_compile_step", "is_dependency_fetch",
 )
 
 _EVENT_FLAGS = {
-    "is_login_failure": "LOGIN_FAILURE",
-    "is_login_success": "LOGIN_SUCCESS",
-    "is_command": "COMMAND_EXECUTION",
-    "is_http": "HTTP_REQUEST",
+    "is_build_failure": "BUILD_FAILURE",
+    "is_build_success": "BUILD_SUCCESS",
+    "is_compile_step": "COMPILE_STEP",
+    "is_dependency_fetch": "DEPENDENCY_FETCH",
 }
 
 
@@ -105,7 +107,7 @@ class Model:
         return cls(json.loads(text), version)
 
     def score(self, event):
-        """Probability that the event is an attack, 0..1."""
+        """Probability that the event is a build-farm incident, 0..1."""
         raw = self._raw(vector(event))
         return 1.0 / (1.0 + math.exp(-raw)) if raw > -700 else 0.0
 
@@ -133,13 +135,13 @@ def apply(event, model):
         event["ml_score"], event["ml_model"], event["ml_reason"] = 0.0, "", ""
         return event
     probability = model.score(event)
-    share = probability if (ML_CAN_BLOCK or event["rule_hits"]) else min(probability, _BELOW_BLOCK)
+    share = probability if (ML_CAN_QUARANTINE or event["rule_hits"]) else min(probability, _BELOW_QUARANTINE)
     final = max(event["rule_score"], share)
     event["ml_score"] = probability
     event["ml_model"] = model.version
-    # Explained only when the model changed the DECISION -- allow to alert,
-    # alert to block -- not merely the score: a rule's block that the model
-    # scores higher is still the rule's block.
+    # Explained only when the model changed the DECISION -- ok to alert,
+    # alert to quarantine -- not merely the score: a rule's quarantine that
+    # the model scores higher is still the rule's quarantine.
     changed = action_for(final) != action_for(event["rule_score"])
     event["ml_reason"] = model.explain(event) if changed else ""
     event["final_anomaly_score"] = final

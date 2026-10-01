@@ -2,7 +2,7 @@
 
 What is left, in order, to run this pipeline in production. Platform and
 data-engineering work only: tuning rules, triaging alerts and judging
-detection quality belong to the SOC (`NOTE_TO_SOC_ANALYST.md`).
+detection quality belong to the build-infrastructure team (`NOTE_TO_BUILD_ENGINEER.md`).
 
 Each phase depends on the ones before it.
 
@@ -53,18 +53,18 @@ Each phase depends on the ones before it.
 
 - [ ] 29. Retention: 90 days raw, 1 year suspicious, `ttl_only_drop_parts`, cold tier on object storage (sign-off from legal/compliance)
 - [ ] 30. Airflow replay DAG: reprocess a time range with a bounded run of the Flink job over those Kafka offsets
-- [ ] 31. Data contract per log source: owner, required fields, expected volume
+- [ ] 31. Data contract per log source (each build tool and CI system): owner, required fields, expected volume
 - [ ] 32. Lineage: OpenLineage from Airflow
 - [ ] 33. Drop `security_events_before_relayout` (2.85 GB) once confirmed unneeded
 
 ## Phase 7 — Real sources and go-live
 
-- [ ] 34. Collectors (Vector / Fluent Bit / syslog) → Kafka for the first real log source
+- [ ] 34. Collectors (Vector / Fluent Bit / the CI system's webhooks) → Kafka for the first real build-log source, mapped onto `schemas/build_event.avsc`
 - [ ] 35. Disable the synthetic producer, the detection-quality DAG and simulator label collection in prod (`WATCHTOWER_SYNTHETIC_TRAFFIC=false`)
 - [ ] 35b. Set the Groq key in prod; a spending limit on the Groq account
 - [ ] 36. Rehearse the prod deploy on staging (a full `make promote`)
 - [ ] 37. Define on-call ownership and escalation for the pipeline
-- [ ] 38. Go live with the first source; hand over operation of the dashboards and verdict tables to the SOC
+- [ ] 38. Go live with the first source; hand over operation of the dashboards and verdict tables to the build-infrastructure team
 
 ---
 

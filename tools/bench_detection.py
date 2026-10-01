@@ -2,8 +2,8 @@
 Per-event detection cost with and without the ML model -- the budget test.
 
 At 1,000 events/s every event has 1 ms, end to end, before the next
-second's arrive. This runs a realistic stream -- ~1,800 sources, normal
-traffic plus brute-force and scan bursts that fill the rolling windows --
+second's arrive. This runs a realistic stream -- ~1,800 runners, normal
+build traffic plus failure-storm and 404-flood bursts that fill the rolling windows --
 through the job's own per-event code (validate -> normalize -> enrich ->
 dedup + features + rules [+ model]), once without the model and once with
 it, and reports what the model adds.
@@ -32,37 +32,43 @@ from core.processor import SourceState  # noqa: E402
 from core.records import enrich, normalize, reject_reason  # noqa: E402
 
 T0 = datetime(2026, 9, 28, 14, 0, tzinfo=timezone.utc)
-HOSTILE = ["185.23.44.12", "41.251.72.91", "45.134.26.7", "193.201.9.88"]
-PATHS = ["/dashboard", "/api/v1/orders", "/login", "/static/app.js", "/reports/export"]
+SICK = ["10.0.14.16", "10.0.14.17", "192.168.4.94", "102.67.14.189"]
+PROJECTS = ["payments-api", "web-frontend", "auth-service", "search-indexer", "kernel-modules"]
+ARTIFACTS = ["/maven2/org/x/lib-1.0.jar", "/npm/react/-/react-18.2.0.tgz", "/crates/api/v1/crates/serde/1.0.1/download"]
 
 
 def stream(n, rate, seed=11):
-    """n events at `rate` per second: 97% normal from ~1,800 hosts, 3%
-    attack bursts from a few hostile sources."""
+    """n events at `rate` per second: 97% normal from ~1,800 runners, 3%
+    incident bursts from a few sick runners."""
     rng = random.Random(seed)
-    hosts = [f"192.168.{i // 250}.{i % 250 + 2}" for i in range(1780)]
+    runners = [f"192.168.{i // 250}.{i % 250 + 2}" for i in range(1780)]
     out = []
     for i in range(n):
         ts = (T0 + timedelta(seconds=i / rate)).isoformat()
         base = {"event_id": str(uuid.UUID(int=rng.getrandbits(128), version=4)), "timestamp": ts,
                 "severity": "INFO", "hostname": "ws-001"}
         if rng.random() < 0.03:
-            src, kind = rng.choice(HOSTILE), rng.choice(["brute", "scan", "web"])
-            if kind == "brute":
-                base.update(event_type="LOGIN_FAILURE", source_ip=src, user=rng.choice(["root", "admin"]),
-                            auth_method="password")
-            elif kind == "scan":
-                base.update(event_type="PORT_SCAN", source_ip=src, user="", target_port=rng.randint(1, 1024))
+            src, kind = rng.choice(SICK), rng.choice(["retry", "oom", "missing"])
+            if kind == "retry":
+                base.update(event_type="BUILD_FAILURE", runner_ip=src, project=rng.choice(PROJECTS),
+                            reason="compile_error", exit_code=1, error_message="error: expected ';'")
+            elif kind == "oom":
+                base.update(event_type="COMPILE_STEP", runner_ip=src, project=rng.choice(PROJECTS),
+                            exit_code=137, error_message="clang: error: unable to execute command: Killed",
+                            duration_ms=rng.randint(20_000, 120_000), peak_memory_mb=rng.randint(7_000, 16_000))
             else:
-                base.update(event_type="HTTP_REQUEST", source_ip=src, user="", http_method="GET",
-                            url_path=f"/admin/{rng.randint(1, 500)}", http_status=404, user_agent="sqlmap/1.8")
+                base.update(event_type="DEPENDENCY_FETCH", runner_ip=src, project=rng.choice(PROJECTS),
+                            http_method="GET", url_path=f"/maven2/com/acme/legacy-{rng.randint(1, 500)}/1.0/x.jar",
+                            http_status=404)
         else:
-            kind = rng.choices(["HTTP_REQUEST", "LOGIN_SUCCESS", "FILE_ACCESS", "COMMAND_EXECUTION",
-                                "LOGIN_FAILURE"], weights=[50, 15, 15, 15, 5])[0]
-            base.update(event_type=kind, source_ip=rng.choice(hosts), user=f"user{rng.randint(1, 900)}",
-                        http_method="GET", url_path=rng.choice(PATHS), http_status=200,
-                        user_agent="Mozilla/5.0", bytes_sent=rng.randint(200, 40_000),
-                        command="ls -la" if kind == "COMMAND_EXECUTION" else None, process_uid=1001)
+            kind = rng.choices(["COMPILE_STEP", "DEPENDENCY_FETCH", "BUILD_SUCCESS", "TEST_RUN",
+                                "BUILD_FAILURE"], weights=[50, 15, 15, 15, 5])[0]
+            base.update(event_type=kind, runner_ip=rng.choice(runners), project=rng.choice(PROJECTS),
+                        http_method="GET", url_path=rng.choice(ARTIFACTS), http_status=200,
+                        user_agent="gradle/8.10.2", bytes_sent=rng.randint(200, 400_000),
+                        command="gcc -O2 -c src/net/parser.c" if kind == "COMPILE_STEP" else None,
+                        duration_ms=rng.randint(300, 20_000), peak_memory_mb=rng.randint(60, 900),
+                        cache_status="hit" if rng.random() < 0.8 else "miss", process_uid=1001)
         out.append(base)
     return out
 
@@ -76,9 +82,9 @@ def run(events, model):
         if reject_reason(event):
             continue
         event = enrich(normalize(event))
-        state = states.get(event["source_ip"])
+        state = states.get(event["runner_ip"])
         if state is None:
-            state = states[event["source_ip"]] = SourceState(model=model)
+            state = states[event["runner_ip"]] = SourceState(model=model)
         if state.process(event) is not None:
             scored.append(event)
     return (time.perf_counter() - t0) / len(events), scored

@@ -1,8 +1,15 @@
 # Watchtower — the streaming path (Flink)
 
-Every security event is decided **the moment it arrives**, not at the next
+Every build-farm event is decided **the moment it arrives**, not at the next
 micro-batch. This document covers what that changed, what latency remains
 and where it comes from, and how the path scales.
+
+> **Measured on the earlier workload.** The latency, per-event cost and
+> throughput figures below were taken when the events were security logs
+> (logins, requests, commands). On 2026-10-01 the events became build logs: a
+> different set of fields and features, the same path -- Kafka, one keyed Flink
+> operator, the ClickHouse Kafka engine -- and per-event work of the same
+> shape. They should carry over; they have not been re-measured.
 
 ## 1. Why the engine changed
 
@@ -21,7 +28,7 @@ batch to run:
 Shortening the trigger shrinks the wait but not the model: every event
 still waits for the batch it lands in. Spark's per-event modes (Continuous
 Processing, and Spark 4.1's Real-Time Mode) only support stateless
-queries, and detection needs per-source state (dedup, rolling windows).
+queries, and detection needs per-runner state (dedup, rolling windows).
 Apache Flink processes one event at a time with keyed state as a
 first-class feature, so the live path moved to Flink.
 
@@ -43,31 +50,31 @@ The Spark job that preceded Flink was removed on 2026-09-28: one engine.
 Kafka security-logs
   -> parse + validate + normalize + enrich        per event, stateless
        \-> dead letters -> Kafka security-logs-rejected -> rejected_events
-  -> keyBy(source_ip)                             one network hop
+  -> keyBy(runner_ip)                             one network hop
   -> dedup + rolling features + rules             per event, keyed state
   -> Kafka security-events-scored
   -> ClickHouse Kafka engine (50 ms blocks) -> MV -> security_events
 ```
 
-- **Order.** Features assume a source's events arrive in event-time order.
-  The producer keys Kafka messages by `source_ip`, so a source is one
+- **Order.** Features assume a runner's events arrive in event-time order.
+  The producer keys Kafka messages by `runner_ip`, so a runner is one
   partition, read by one source subtask; parsing is chained to the source
-  (same parallelism, no rebalance), so every event of a source reaches the
+  (same parallelism, no rebalance), so every event of a runner reaches the
   keyed operator through one path.
-- **State.** Per source: a small summary (running sums, sizes, three
+- **State.** Per runner: a small summary (running sums, sizes, three
   positions in a record log), the window's records, the distinct
-  user/port/path counts, and the event_ids seen in the last 10 minutes —
+  project/exit-code/artifact counts, and the event_ids seen in the last 10 minutes —
   each as its own Flink state, so an event touches a handful of entries,
   never the whole window. (The first version stored one pickled object per
-  source and fell behind once windows filled: every event re-serialised its
-  source's entire window, 12,000 records for a 30-events/s brute force.)
-- **Forgetting a source.** A processing-time timer clears ALL of a source's
+  runner and fell behind once windows filled: every event re-serialised its
+  runner's entire window, 12,000 records for a 30-events/s failure storm.)
+- **Forgetting a runner.** A processing-time timer clears ALL of a runner's
   state at once after 15 idle minutes. Not a state TTL: a TTL expires each
   entry on its own, and a window record can outlive its write time by more
   than 15 minutes while the summary pointing at it is fresh (a backlog
   replays hours of event time in minutes of wall time, and the reverse).
   That happened once, live: a record expired under a live summary and the
-  job crashed on the next event of that source.
+  job crashed on the next event of that runner.
 - **Python in the JVM.** PyFlink runs in *thread* mode: Python is embedded
   in the TaskManager JVM and every state access is an in-process call. In
   the default *process* mode each state read that misses a cache is a gRPC
@@ -93,7 +100,7 @@ Kafka security-logs
   event. It is picked up from ClickHouse within 5 minutes of promotion,
   without a restart; `WATCHTOWER_ML=off` switches it off. The LLM (Groq)
   never scores live — a remote call per event would stall the stream — it
-  reviews allowed events hourly, offline ([`orchestration.md`](orchestration.md)).
+  reviews passed events hourly, offline ([`orchestration.md`](orchestration.md)).
 
 ### Data quality between the steps
 
@@ -103,8 +110,8 @@ without being changed or dropped:
 | after | counted as `dq_<step>_<issue>` | meaning |
 |---|---|---|
 | validate | the reject reason | refused (dead-letter), by reason |
-| normalize | `severity_defaulted`, `missing_user`, `missing_hostname` | kept, but a field was blank or unknown |
-| enrich | `unknown_country`, `future_timestamp`, `stale_timestamp` | an external IP GeoIP cannot place; event time > 5 min ahead or > 1 day behind the job's clock |
+| normalize | `severity_defaulted`, `missing_project`, `missing_hostname` | kept, but a field was blank or unknown |
+| enrich | `unknown_region`, `future_timestamp`, `stale_timestamp` | an external runner the inventory cannot place; event time > 5 min ahead or > 1 day behind the job's clock |
 | features | `window_inconsistent` | a 1-minute count above its 5-minute one: a bug or corrupted state |
 | rules | `score_out_of_range`, `action_mismatch` | the decision contradicts its score: a bug |
 
@@ -138,7 +145,7 @@ of ~1,150–1,300/s were the job starved by a swapping VM, see below.)
 
 Event **created** by the producer → row **stored** in ClickHouse
 (`ingested_at - timestamp`), 48 consecutive 30-second samples, every
-source's 5-minute window full:
+runner's 5-minute window full:
 
 | | median | p95 | p99 | worst event |
 |---|---|---|---|---|
@@ -230,9 +237,9 @@ make fewer calls, not faster Python:
 | change | effect |
 |---|---|
 | each window's head record cached in the summary | window reads 5.9 → 1.9 per event |
-| distinct user/port/path counts inside the summary until one exceeds 64 entries | 4.7 map calls → 0 for ordinary sources |
+| distinct project/exit-code/artifact counts inside the summary until one exceeds 64 entries | 4.7 map calls → 0 for ordinary runners |
 | counters batched, pushed once a second | 2 JVM calls → 0 per event |
-| idle timer registered once per source-minute, not per event | 1 → ~0 |
+| idle timer registered once per runner-minute, not per event | 1 → ~0 |
 | dedup from a ring of the last 1,024 id hashes in the summary, not a TTL'd map | 2 TTL calls (~46 µs) → 0 |
 | wall clock read in Python | 1 → 0 |
 
@@ -240,7 +247,7 @@ State calls per event went from 16.5 to ~8; the whole job, isolated on a
 mini-cluster, from 189 to 173 µs per event (~5,100 → ~5,800 events/s). Not
 done: fusing parse into the keyed operator (key by the Kafka message key)
 measured another -18 µs (~10%), but makes "every producer keys by
-source_ip" a hard requirement; the windows would silently mix sources if one
+runner_ip" a hard requirement; the windows would silently mix runners if one
 did not.
 
 **Capacity per TaskManager, reading from Kafka** (`tools/drain_test.sh`,

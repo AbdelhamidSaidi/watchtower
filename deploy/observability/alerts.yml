@@ -30,8 +30,8 @@ groups:
 
       # Data quality between the transformation steps (etl/core/dq.py):
       # events that got through validation but are doubtful -- defaulted
-      # severity, no user on a login, an address GeoIP cannot place, a
-      # clock far off. A little is normal; a source sending them in bulk
+      # severity, no project on a build, a runner the inventory cannot place, a
+      # clock far off. A little is normal; a runner sending them in bulk
       # quietly weakens detection.
       - alert: StreamDataQualityDegraded
         expr: >-
@@ -44,7 +44,7 @@ groups:
           summary: "{{ $value | humanizePercentage }} of events doubtful after normalize/enrich"
           description: >-
             Which issue: the dq_normalize_* / dq_enrich_* series on the
-            Grafana dashboard. Usually one log source changed its format.
+            Grafana dashboard. Usually one build tool changed its log format.
 
       # Features and rules contradicting themselves (a 1-minute count above
       # its 5-minute one, an action that does not match the score) is a bug

@@ -450,8 +450,8 @@
     {
       "id": 8,
       "type": "stat",
-      "title": "Attacks caught (1 h)",
-      "description": "Attacks (one scenario from one source, split on a 60 s pause) that ended in the last hour with at least one event flagged.",
+      "title": "Incidents caught (1 h)",
+      "description": "Incidents (one scenario from one source, split on a 60 s pause) that ended in the last hour with at least one event flagged.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -499,7 +499,7 @@
       },
       "targets": [
         {
-          "expr": "round(sum(increase(watchtower_attacks_total{outcome=\"caught\"}[1h]))) or vector(0)",
+          "expr": "round(sum(increase(watchtower_incidents_total{outcome=\"caught\"}[1h]))) or vector(0)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -512,8 +512,8 @@
     {
       "id": 9,
       "type": "stat",
-      "title": "Attacks missed (1 h)",
-      "description": "Attacks that ended in the last hour with EVERY event allowed.",
+      "title": "Incidents missed (1 h)",
+      "description": "Incidents that ended in the last hour with EVERY event passed.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -565,7 +565,7 @@
       },
       "targets": [
         {
-          "expr": "round(sum(increase(watchtower_attacks_total{outcome=\"missed\"}[1h]))) or vector(0)",
+          "expr": "round(sum(increase(watchtower_incidents_total{outcome=\"missed\"}[1h]))) or vector(0)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -579,7 +579,7 @@
       "id": 10,
       "type": "stat",
       "title": "Recall (15 min)",
-      "description": "Attack events flagged (alert or block) by the final decision. Behavioural rules need an attack's first few events before they can fire, so 100% is not the target: every ATTACK caught is.",
+      "description": "Incident events flagged (alert or quarantine) by the final decision. Behavioural rules need an incident's first few events before they can fire, so 100% is not the target: every INCIDENT caught is.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -635,7 +635,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"final\",truth=\"attack\",verdict=\"flagged\"}[15m]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"final\",truth=\"attack\"}[15m])), 1)",
+          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"final\",truth=\"incident\",verdict=\"flagged\"}[15m]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"final\",truth=\"incident\"}[15m])), 1)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -649,7 +649,7 @@
       "id": 11,
       "type": "stat",
       "title": "Precision (15 min)",
-      "description": "Of the events flagged, the share that were attacks. Includes containment: a compromised host's normal traffic blocked with its attack.",
+      "description": "Of the events flagged, the share that were incidents. Includes containment: a compromised host's normal traffic quarantined with its incident.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -705,7 +705,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"final\",truth=\"attack\",verdict=\"flagged\"}[15m]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"final\",verdict=\"flagged\"}[15m])), 1)",
+          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"final\",truth=\"incident\",verdict=\"flagged\"}[15m]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"final\",verdict=\"flagged\"}[15m])), 1)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -718,8 +718,8 @@
     {
       "id": 12,
       "type": "stat",
-      "title": "Uninvolved hosts blocked (1 h)",
-      "description": "Normal events blocked on hosts that had not attacked in the 5 minutes before: the false positives that matter. Blocks on an attacking host are containment.",
+      "title": "Uninvolved hosts quarantined (1 h)",
+      "description": "Normal events quarantined on hosts that had not hit in the 5 minutes before: the false positives that matter. Blocks on an affected host are containment.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -775,7 +775,7 @@
       },
       "targets": [
         {
-          "expr": "round(sum(increase(watchtower_normal_blocked_total{host=\"uninvolved\"}[1h])))",
+          "expr": "round(sum(increase(watchtower_normal_quarantined_total{host=\"uninvolved\"}[1h])))",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -789,7 +789,7 @@
       "id": 13,
       "type": "stat",
       "title": "Time to first flag, median (1 h)",
-      "description": "From an attack's first event to its first flag, for sources not already under suspicion. The detection-quality threshold is 5 s.",
+      "description": "From an incident's first event to its first flag, for sources not already under suspicion. The detection-quality threshold is 5 s.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -845,7 +845,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(watchtower_attack_time_to_flag_seconds_bucket{known_source=\"false\"}[1h])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(watchtower_incident_time_to_flag_seconds_bucket{known_source=\"false\"}[1h])))",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -859,7 +859,7 @@
       "id": 14,
       "type": "stat",
       "title": "Model alone: precision (1 h)",
-      "description": "The model on its own (ml_score >= 0.65, rules ignored) against ground truth: of what it would flag, the share that were attacks.",
+      "description": "The model on its own (ml_score >= 0.65, rules ignored) against ground truth: of what it would flag, the share that were incidents.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -915,7 +915,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"model\",truth=\"attack\",verdict=\"flagged\"}[1h]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"model\",verdict=\"flagged\"}[1h])), 1)",
+          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"model\",truth=\"incident\",verdict=\"flagged\"}[1h]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"model\",verdict=\"flagged\"}[1h])), 1)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -929,7 +929,7 @@
       "id": 15,
       "type": "stat",
       "title": "Model alone: recall (1 h)",
-      "description": "The model on its own: of the attack events, the share it would flag.",
+      "description": "The model on its own: of the incident events, the share it would flag.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -985,7 +985,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"model\",truth=\"attack\",verdict=\"flagged\"}[1h]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"model\",truth=\"attack\"}[1h])), 1)",
+          "expr": "(sum(increase(watchtower_detector_events_total{detector=\"model\",truth=\"incident\",verdict=\"flagged\"}[1h]))) / clamp_min(sum(increase(watchtower_detector_events_total{detector=\"model\",truth=\"incident\"}[1h])), 1)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -998,8 +998,8 @@
     {
       "id": 16,
       "type": "stat",
-      "title": "Model's own alerts that were attacks (1 h)",
-      "description": "Events flagged with no rule behind them -- the model's decision alone -- that were attacks. The guard rolls a model back when the AI reviewer calls over half of these benign.",
+      "title": "Model's own alerts that were incidents (1 h)",
+      "description": "Events flagged with no rule behind them -- the model's decision alone -- that were incidents. The guard rolls a model back when the AI reviewer calls over half of these normal.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1055,7 +1055,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(increase(watchtower_model_only_flags_total{truth=\"attack\"}[1h]))) / clamp_min(sum(increase(watchtower_model_only_flags_total[1h])), 1)",
+          "expr": "(sum(increase(watchtower_model_only_flags_total{truth=\"incident\"}[1h]))) / clamp_min(sum(increase(watchtower_model_only_flags_total[1h])), 1)",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
@@ -2070,8 +2070,8 @@
     {
       "id": 33,
       "type": "timeseries",
-      "title": "Recall — attack events flagged (15 min)",
-      "description": "Per detector, the share of attack events it flags. rules: rule_score >= 0.65; model: ml_score >= 0.65; final: what the pipeline did.",
+      "title": "Recall — incident events flagged (15 min)",
+      "description": "Per detector, the share of incident events it flags. rules: rule_score >= 0.65; model: ml_score >= 0.65; final: what the pipeline did.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2116,7 +2116,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (detector) (increase(watchtower_detector_events_total{truth=\"attack\",verdict=\"flagged\"}[15m])) / clamp_min(sum by (detector) (increase(watchtower_detector_events_total{truth=\"attack\"}[15m])), 1)",
+          "expr": "sum by (detector) (increase(watchtower_detector_events_total{truth=\"incident\",verdict=\"flagged\"}[15m])) / clamp_min(sum by (detector) (increase(watchtower_detector_events_total{truth=\"incident\"}[15m])), 1)",
           "legendFormat": "{{detector}}",
           "refId": "A",
           "datasource": {
@@ -2129,7 +2129,7 @@
     {
       "id": 34,
       "type": "timeseries",
-      "title": "Precision — flagged events that were attacks (15 min)",
+      "title": "Precision — flagged events that were incidents (15 min)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2175,7 +2175,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (detector) (increase(watchtower_detector_events_total{truth=\"attack\",verdict=\"flagged\"}[15m])) / clamp_min(sum by (detector) (increase(watchtower_detector_events_total{verdict=\"flagged\"}[15m])), 1)",
+          "expr": "sum by (detector) (increase(watchtower_detector_events_total{truth=\"incident\",verdict=\"flagged\"}[15m])) / clamp_min(sum by (detector) (increase(watchtower_detector_events_total{verdict=\"flagged\"}[15m])), 1)",
           "legendFormat": "{{detector}}",
           "refId": "A",
           "datasource": {
@@ -2248,7 +2248,7 @@
     {
       "id": 36,
       "type": "bargauge",
-      "title": "Attack events flagged, per scenario (1 h)",
+      "title": "Incident events flagged, per scenario (1 h)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2305,7 +2305,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\",action!=\"allow\"}[1h])) / clamp_min(sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\"}[1h])), 1)",
+          "expr": "sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\",action!=\"ok\"}[1h])) / clamp_min(sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\"}[1h])), 1)",
           "legendFormat": "{{scenario}}",
           "refId": "A",
           "datasource": {
@@ -2320,7 +2320,7 @@
     {
       "id": 37,
       "type": "bargauge",
-      "title": "Attack events blocked, per scenario (1 h)",
+      "title": "Incident events quarantined, per scenario (1 h)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2377,7 +2377,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\",action=\"block\"}[1h])) / clamp_min(sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\"}[1h])), 1)",
+          "expr": "sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\",action=\"quarantine\"}[1h])) / clamp_min(sum by (scenario) (increase(watchtower_truth_decisions_total{scenario!=\"normal\"}[1h])), 1)",
           "legendFormat": "{{scenario}}",
           "refId": "A",
           "datasource": {
@@ -2392,7 +2392,7 @@
     {
       "id": 38,
       "type": "bargauge",
-      "title": "Attacks ended (1 h): caught / missed",
+      "title": "Incidents ended (1 h): caught / missed",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2441,7 +2441,7 @@
       },
       "targets": [
         {
-          "expr": "round(sum by (scenario, outcome) (increase(watchtower_attacks_total[1h])))",
+          "expr": "round(sum by (scenario, outcome) (increase(watchtower_incidents_total[1h])))",
           "legendFormat": "{{scenario}} · {{outcome}}",
           "refId": "A",
           "datasource": {
@@ -2456,8 +2456,8 @@
     {
       "id": 39,
       "type": "timeseries",
-      "title": "Time from an attack's first event to its first flag (30 min)",
-      "description": "Known sources attacked in the 5 minutes before: their windows already carry the evidence.",
+      "title": "Time from an incident's first event to its first flag (30 min)",
+      "description": "Known sources hit in the 5 minutes before: their windows already carry the evidence.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2502,7 +2502,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(watchtower_attack_time_to_flag_seconds_bucket{known_source=\"false\"}[30m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(watchtower_incident_time_to_flag_seconds_bucket{known_source=\"false\"}[30m])))",
           "legendFormat": "median, fresh sources",
           "refId": "A",
           "datasource": {
@@ -2511,7 +2511,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(watchtower_attack_time_to_flag_seconds_bucket{known_source=\"false\"}[30m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(watchtower_incident_time_to_flag_seconds_bucket{known_source=\"false\"}[30m])))",
           "legendFormat": "p95, fresh sources",
           "refId": "B",
           "datasource": {
@@ -2520,7 +2520,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(watchtower_attack_time_to_flag_seconds_bucket{known_source=\"true\"}[30m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(watchtower_incident_time_to_flag_seconds_bucket{known_source=\"true\"}[30m])))",
           "legendFormat": "median, known sources",
           "refId": "C",
           "datasource": {
@@ -2533,8 +2533,8 @@
     {
       "id": 40,
       "type": "timeseries",
-      "title": "Normal traffic blocked (per 5 min)",
-      "description": "attacking: containment, the host attacked within 5 minutes. uninvolved: a false positive.",
+      "title": "Normal traffic quarantined (per 5 min)",
+      "description": "affected: containment, the host hit within 5 minutes. uninvolved: a false positive.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2579,7 +2579,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (host) (increase(watchtower_normal_blocked_total[5m]))",
+          "expr": "sum by (host) (increase(watchtower_normal_quarantined_total[5m]))",
           "legendFormat": "{{host}} host",
           "refId": "A",
           "datasource": {
@@ -2858,7 +2858,7 @@
           }
         },
         {
-          "expr": "watchtower_model_holdout_events{kind=\"normal\"}",
+          "expr": "watchtower_model_holdout_events{kind=\"false_alarms\"}",
           "legendFormat": "normal events",
           "refId": "B",
           "datasource": {
@@ -3063,7 +3063,7 @@
       "id": 49,
       "type": "timeseries",
       "title": "Decisions the model changed (per min)",
-      "description": "By ground truth: raised decisions on attacks help; on normal traffic they are the model's false alarms.",
+      "description": "By ground truth: raised decisions on incidents help; on normal traffic they are the model's false alarms.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3329,7 +3329,7 @@
       "id": 53,
       "type": "stat",
       "title": "Guard: active model's alerts reviewed (24 h)",
-      "description": "Rollback when at least 20 are reviewed and over half are called benign.",
+      "description": "Rollback when at least 20 are reviewed and over half are called normal.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3386,8 +3386,8 @@
           }
         },
         {
-          "expr": "watchtower_guard_model_alerts_24h{kind=\"benign\"}",
-          "legendFormat": "called benign",
+          "expr": "watchtower_guard_model_alerts_24h{kind=\"false_alarms\"}",
+          "legendFormat": "false alarms",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -3400,7 +3400,7 @@
       "id": 54,
       "type": "bargauge",
       "title": "Training labels",
-      "description": "simulator: ground truth (attacks + a per-host sample of normal traffic); reviewer: the AI's confident disagreements.",
+      "description": "simulator: ground truth (incidents + a per-host sample of normal traffic); reviewer: the AI's confident disagreements.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

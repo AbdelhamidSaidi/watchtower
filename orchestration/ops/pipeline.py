@@ -212,7 +212,7 @@ def ensure_stream_job(wait_s=300, poll_s=10, get_json=_get_json, restart=restart
 
 def dq_counters(get_json=_get_json):
     """The stream job's data-quality counters, summed over its subtasks:
-    {"normalize_missing_user": n, ..., "scored": n}. None if unreadable.
+    {"normalize_missing_project": n, ..., "scored": n}. None if unreadable.
 
     Counters start again from 0 when the job restarts; sample_flow keeps
     only increases.

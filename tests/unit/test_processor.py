@@ -47,19 +47,19 @@ def test_dedup_memory_is_bounded_by_the_horizon():
     assert len(state.seen) == 1
 
 
-def test_brute_force_is_blocked_on_the_20th_failure_not_later():
+def test_a_failure_storm_is_quarantined_on_the_20th_failure_not_later():
     state = SourceState()
-    rows = [state.process(at(i, source_ip="45.134.26.7", event_type="LOGIN_FAILURE", user="root"))
+    rows = [state.process(at(i, runner_ip="192.168.1.77", event_type="BUILD_FAILURE", project="payments-api"))
             for i in range(25)]
     actions = [r["recommended_action"] for r in rows]
-    assert actions[:19] == ["allow"] * 19
-    assert actions[19] == "block" and "brute_force" in rows[19]["rule_hits"]
+    assert actions[:19] == ["ok"] * 19
+    assert actions[19] == "quarantine" and "failure_storm" in rows[19]["rule_hits"]
 
 
 def test_row_matches_the_clickhouse_contract():
-    row = SourceState().process(at(0, source_ip="45.134.26.7"))
+    row = SourceState().process(at(0, runner_ip="102.67.14.50"))
     assert row["timestamp"] == "2026-09-20 14:00:00.000"
-    assert row["country_code"] == "NL"
+    assert row["region"] == "cloud-af"
     assert row["is_internal_ip"] == 0
     json.dumps(row)  # serialisable as-is
     assert "_ts" not in row
@@ -86,7 +86,7 @@ def test_decoder_names_the_wire_error(raw, reason, schema_json):
 
 
 def test_decoder_round_trips_a_producer_message(schema_json):
-    source = make_event(url_path="/login", http_status=200, bytes_sent=10**10)
+    source = make_event(url_path="/artifacts/payments-api/build.tar.gz", http_status=201, bytes_sent=10**10)
     event, wire_error, schema_id = Decoder({SCHEMA_ID: schema_json}).decode(encode(source))
     assert wire_error is None and schema_id == SCHEMA_ID
     assert event["bytes_sent"] == 10**10
@@ -105,7 +105,7 @@ def test_state_pickles_for_flink_keyed_state():
 
     state = SourceState()
     for i in range(50):
-        state.process(at(i, event_type="LOGIN_FAILURE", event_id=str(uuid.uuid4())))
+        state.process(at(i, event_type="BUILD_FAILURE", event_id=str(uuid.uuid4())))
     restored = pickle.loads(pickle.dumps(state))
-    nxt = at(60, event_type="LOGIN_FAILURE")
+    nxt = at(60, event_type="BUILD_FAILURE")
     assert restored.process(dict(nxt)) == state.process(dict(nxt))

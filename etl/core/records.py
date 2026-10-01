@@ -22,6 +22,8 @@ from core.vocab import (
     EVENT_FIELDS,
     KNOWN_EVENT_TYPES,
     KNOWN_SEVERITIES,
+    MAX_DURATION_MS,
+    MAX_EXIT_CODE,
     MAX_PORT,
     UNKNOWN_UID,
     UUID_REGEX,
@@ -31,7 +33,7 @@ MAGIC_BYTE = 0
 _KNOWN_EVENT_TYPES = frozenset(KNOWN_EVENT_TYPES)
 _KNOWN_SEVERITIES = frozenset(KNOWN_SEVERITIES)
 _UUID = re.compile(UUID_REGEX)
-_GEO = dict(ind.GEOIP_PREFIXES)
+_REGION = dict(ind.REGION_PREFIXES)
 
 
 def _re(pattern):
@@ -39,13 +41,16 @@ def _re(pattern):
 
 
 _PRIVATE = _re(ind.PRIVATE_IP_REGEX)
-_SQLI = _re(ind.SQLI_REGEX)
-_TRAVERSAL = _re(ind.TRAVERSAL_REGEX)
-_XSS = _re(ind.XSS_REGEX)
-_SCANNER = _re(ind.SCANNER_AGENT_REGEX)
-_SENSITIVE_PATH = _re(ind.SENSITIVE_PATH_REGEX)
-_SENSITIVE_COMMAND = _re(ind.SENSITIVE_COMMAND_REGEX)
-_SENSITIVE_FILE = _re(ind.SENSITIVE_FILE_REGEX)
+# Checked in this order; the first that matches names the signature.
+_SIGNATURES = [
+    ("ice", _re(ind.ICE_REGEX)),
+    ("oom", _re(ind.OOM_REGEX)),
+    ("disk_full", _re(ind.DISK_FULL_REGEX)),
+    ("checksum_mismatch", _re(ind.CHECKSUM_REGEX)),
+]
+_ROGUE_COMMAND = _re(ind.ROGUE_COMMAND_REGEX)
+_ROGUE_FILE = _re(ind.ROGUE_FILE_REGEX)
+_UNTRUSTED_FETCH = _re(ind.UNTRUSTED_FETCH_REGEX)
 
 
 def _trim(value):
@@ -146,22 +151,27 @@ def reject_reason(event, wire_error=None):
         return "missing_event_type"
     if _trim(event["event_type"]).upper() not in _KNOWN_EVENT_TYPES:
         return "unknown_event_type"
-    if _blank(event.get("source_ip")):
-        return "missing_source_ip"
-    if _out_of(event.get("target_port"), 0, MAX_PORT) or _out_of(event.get("dest_port"), 0, MAX_PORT):
+    if _blank(event.get("runner_ip")):
+        return "missing_runner_ip"
+    if _out_of(event.get("exit_code"), 0, MAX_EXIT_CODE):
+        return "exit_code_out_of_range"
+    if _out_of(event.get("dest_port"), 0, MAX_PORT):
         return "port_out_of_range"
     if _out_of(event.get("http_status"), 100, 599):
         return "invalid_http_status"
+    if _out_of(event.get("duration_ms"), 0, MAX_DURATION_MS):
+        return "duration_out_of_range"
     event["_ts"] = ts
     return None
 
 
 # --- normalize ------------------------------------------------------------------
 
-_LOWER = ["user", "hostname", "reason", "log_source", "outcome", "protocol",
-          "auth_method", "file_operation", "process_name", "parent_process"]
-_TEXT = ["command", "url_path", "user_agent", "file_path", "session_id", "dest_ip"]
-_ZERO = ["target_port", "dest_port", "http_status", "bytes_sent", "response_time_ms", "process_id"]
+_LOWER = ["project", "hostname", "reason", "log_source", "outcome", "protocol",
+          "triggered_by", "step", "process_name", "parent_process", "cache_status"]
+_TEXT = ["command", "url_path", "user_agent", "file_path", "build_id", "dest_ip", "error_message"]
+_ZERO = ["exit_code", "dest_port", "http_status", "bytes_sent", "response_time_ms", "process_id",
+         "duration_ms", "peak_memory_mb"]
 
 
 def normalize(event):
@@ -177,7 +187,7 @@ def normalize(event):
     event["http_method"] = _trim(event.get("http_method") or "").upper()
     severity = _trim(event.get("severity") or "").upper()
     event["severity"] = severity if severity in _KNOWN_SEVERITIES else DEFAULT_SEVERITY
-    event["source_ip"] = _trim(event["source_ip"])
+    event["runner_ip"] = _trim(event["runner_ip"])
     if event.get("process_uid") is None:
         event["process_uid"] = UNKNOWN_UID
     return event
@@ -189,31 +199,31 @@ def _flag(condition):
     return 1 if condition else 0
 
 
+def _signature(message):
+    for name, pattern in _SIGNATURES:
+        if pattern.search(message):
+            return name
+    return ""
+
+
 def enrich(event):
-    """Indicators and GeoIP. In place."""
-    url = event["url_path"]
-    if _SQLI.search(url):
-        signature = "sqli"
-    elif _TRAVERSAL.search(url):
-        signature = "path_traversal"
-    elif _XSS.search(url):
-        signature = "xss"
-    else:
-        signature = ""
-    event["request_signature"] = signature
-    event["is_attack_signature"] = _flag(signature)
-    event["is_scanner_agent"] = _flag(_SCANNER.search(event["user_agent"]))
-    event["is_sensitive_path"] = _flag(_SENSITIVE_PATH.search(url))
-    event["is_sensitive_command"] = _flag(
-        _SENSITIVE_COMMAND.search(event["command"]) or _SENSITIVE_FILE.search(event["file_path"])
+    """Indicators and region. In place."""
+    signature = _signature(event["error_message"])
+    event["failure_signature"] = signature
+    event["is_failure_signature"] = _flag(signature)
+    event["is_untrusted_fetch"] = _flag(_UNTRUSTED_FETCH.search(event["url_path"]))
+    event["is_rogue_command"] = _flag(
+        _ROGUE_COMMAND.search(event["command"]) or _ROGUE_FILE.search(event["file_path"])
     )
     event["is_privileged"] = _flag(event["process_uid"] == 0)
-    event["is_internal_ip"] = _flag(_PRIVATE.search(event["source_ip"]))
+    event["is_slow_step"] = _flag(event["event_type"] == "COMPILE_STEP" and event["duration_ms"] >= ind.SLOW_STEP_MS)
+    event["is_cache_miss"] = _flag(event["cache_status"] in ("miss", "corrupt"))
+    event["is_internal_ip"] = _flag(_PRIVATE.search(event["runner_ip"]))
     hour = event["_ts"].hour
     event["hour"] = hour
     event["is_night"] = _flag(hour >= ind.NIGHT_START_HOUR or hour < ind.NIGHT_END_HOUR)
-    octets = event["source_ip"].split(".")
-    event["country_code"] = _GEO.get(".".join(octets[:2]), "")
+    octets = event["runner_ip"].split(".")
+    event["region"] = _REGION.get(".".join(octets[:2]), "")
     return event
 
 

@@ -2,7 +2,7 @@
 
     collect_labels   hourly: the simulator's ground truth for the closed hour,
                      read back out of Kafka, into watchtower.training_labels
-                     (every attack event; normal ones sampled per source)
+                     (every incident event; normal ones sampled per source)
     dataset          labels joined to the features the pipeline stored;
                      a reviewer label outranks the simulator's
     train            LightGBM, sized for the stream (~5 us per event)
@@ -13,7 +13,7 @@
     promote          only if the candidate is at least as good on both
 
 A model never goes live because it is new, only because it measured
-better on data neither model trained on -- and would not flood the SOC
+better on data neither model trained on -- and would not flood the on-call
 with alerts on today's traffic.
 """
 
@@ -31,11 +31,11 @@ from etl import config
 from orchestration.ops.clickhouse import ClickHouse
 
 # Normal events are ~97% of traffic; keeping them all would drown the
-# attacks and fill the table, and a uniform sample would all but miss the
-# quiet hosts -- a 2% sample left remote staff so thin that a model learned
-# "external IP + data volume" as an attack and alerted on every VPN user.
+# incidents and fill the table, and a uniform sample would all but miss the
+# quiet runners -- a 2% sample left the cloud spot runners so thin that a model
+# learned "external IP + big download" as an incident and alerted on every one.
 # So up to PER_SOURCE normal events per source per hour are kept, each
-# weighted by how many it stands for. Every attack event is kept.
+# weighted by how many it stands for. Every incident event is kept.
 PER_SOURCE = 5
 
 # Sized for per-event scoring in the stream: ~100 trees x 15 leaves costs
@@ -54,7 +54,7 @@ PARAMS = {
 }
 MAX_TREES = 120
 MIN_ROWS = 2_000          # below this, a model says more about noise than traffic
-MIN_ATTACKS = 200
+MIN_INCIDENTS = 200
 # A reviewer label enters training only this sure, and weighs less than
 # ground truth: an LLM is a second opinion, not an oracle.
 REVIEW_MIN_CONFIDENCE = 0.8
@@ -62,7 +62,7 @@ REVIEW_WEIGHT = 0.5
 
 # Shadow check: recent real traffic, scored by the candidate and the active
 # model. Alerts the model raises alone -- no rule behind them -- go straight
-# to an analyst, so a candidate may raise at most this share of events that
+# to an engineer, so a candidate may raise at most this share of events that
 # way, not many more than the active model does, on not many more hosts.
 # The sample spans SHADOW_HOURS and caps each source at SHADOW_PER_SOURCE:
 # the newest hour alone once missed the one group of hosts a model was
@@ -85,10 +85,10 @@ class NormalSampler:
     def __init__(self, per_source=PER_SOURCE, rng=None):
         self.per_source = per_source
         self.rng = rng or random.Random()
-        self.sources = {}                    # source_ip -> [events seen, kept ids]
+        self.sources = {}                    # runner_ip -> [events seen, kept ids]
 
-    def add(self, source_ip, event_id):
-        slot = self.sources.setdefault(source_ip, [0, []])
+    def add(self, runner_ip, event_id):
+        slot = self.sources.setdefault(runner_ip, [0, []])
         slot[0] += 1
         if len(slot[1]) < self.per_source:
             slot[1].append(event_id)
@@ -107,7 +107,7 @@ def collect_labels(start_ms, end_ms, per_source=PER_SOURCE, seed=None):
     """The simulator's labels for events appended to Kafka in [start, end).
 
     Streams through the hour once and keeps only what training needs --
-    every attack event, and NormalSampler's share of normal ones -- so
+    every incident event, and NormalSampler's share of normal ones -- so
     memory stays flat however busy the hour was. Returns rows for
     watchtower.training_labels.
     """
@@ -150,7 +150,7 @@ def collect_labels(start_ms, end_ms, per_source=PER_SOURCE, seed=None):
                         continue
                     scenario = record.get("scenario") or "normal"
                     if scenario == "normal":
-                        normals.add(record.get("source_ip") or "", record["event_id"])
+                        normals.add(record.get("runner_ip") or "", record["event_id"])
                         continue
                     rows.append({"event_id": record["event_id"], "label": 1,
                                  "source": "simulator", "weight": 1.0, "detail": scenario})
@@ -192,7 +192,7 @@ def dataset(ch, since_days=14):
 def _stored_features():
     """FEATURES minus the four event-type flags, which core.ml derives from
     event_type rather than reading a column."""
-    derived = {"is_login_failure", "is_login_success", "is_command", "is_http"}
+    derived = {"is_build_failure", "is_build_success", "is_compile_step", "is_dependency_fetch"}
     return [f for f in FEATURES if f not in derived]
 
 
@@ -229,7 +229,7 @@ def train(rows):
 def weights(rows):
     """Each row's training weight. A sampled normal row stands for many
     events (NormalSampler), so the model sees the real base rate: trained
-    on counts, attacks look like most of the traffic and every score is
+    on counts, incidents look like most of the traffic and every score is
     inflated. A reviewer's label counts as REVIEW_WEIGHT of a typical
     sampled normal row -- next to rows worth dozens of events, its own
     weight of ~1 would be lost."""
@@ -244,7 +244,7 @@ def metrics(scores, labels, threshold=0.65):
     positives = sum(labels)
     negatives = len(labels) - positives
     # Average precision: the area under the precision-recall curve -- the
-    # honest number when attacks are rare.
+    # honest number when incidents are rare.
     hits, ap = 0, 0.0
     for rank, (_, label) in enumerate(pairs, 1):
         if label:
@@ -255,7 +255,7 @@ def metrics(scores, labels, threshold=0.65):
     fp = len(flagged) - tp
     return {
         "rows": len(labels),
-        "attacks": positives,
+        "incidents": positives,
         "normal": negatives,
         "false_positives": fp,
         "average_precision": ap / positives if positives else None,
@@ -282,10 +282,10 @@ def recent_traffic(ch, limit=SHADOW_ROWS):
     SHADOW_PER_SOURCE events per source."""
     columns = ", ".join(_stored_features())
     return ch.rows(
-        f"SELECT event_type, rule_score, rule_hits, source_ip, {columns} FROM watchtower.security_events "
+        f"SELECT event_type, rule_score, rule_hits, runner_ip, {columns} FROM watchtower.security_events "
         "WHERE timestamp > (SELECT max(timestamp) FROM watchtower.security_events) - toIntervalHour({h:UInt32}) "
         "AND cityHash64(event_id) % 100 < {pct:UInt32} "
-        "ORDER BY cityHash64(event_id) LIMIT {per:UInt32} BY source_ip LIMIT {n:UInt32}",
+        "ORDER BY cityHash64(event_id) LIMIT {per:UInt32} BY runner_ip LIMIT {n:UInt32}",
         h=SHADOW_HOURS, pct=SHADOW_SAMPLE_PERCENT, per=SHADOW_PER_SOURCE, n=limit)
 
 
@@ -294,11 +294,11 @@ def model_alerts(dump, rows):
     fired, its score alone crossed the line: (how many, on which sources)."""
     model = Model(dump, "shadow")
     raised = [r for r in rows if not r["rule_hits"] and ml.apply(dict(r), model)["ml_reason"]]
-    return len(raised), {r.get("source_ip", "") for r in raised}
+    return len(raised), {r.get("runner_ip", "") for r in raised}
 
 
 def shadow(candidate_dump, incumbent_dump, rows):
-    out = {"rows": len(rows), "sources": len({r.get("source_ip", "") for r in rows}),
+    out = {"rows": len(rows), "sources": len({r.get("runner_ip", "") for r in rows}),
            "candidate_alerts": 0, "candidate_sources": 0, "incumbent_alerts": None, "incumbent_sources": None}
     if not rows:
         return out
@@ -312,7 +312,7 @@ def shadow(candidate_dump, incumbent_dump, rows):
 
 def better(candidate, incumbent, reviewed=None, shadowed=None, tolerance=0.005):
     """Promote when, against the incumbent on the same holdout:
-      - it ranks attacks at least as well (average precision, within
+      - it ranks incidents at least as well (average precision, within
         `tolerance`),
       - its false alarms stay within what chance explains
         (false_alarm_bound), and
@@ -342,7 +342,7 @@ def better(candidate, incumbent, reviewed=None, shadowed=None, tolerance=0.005):
             return True, "no active model yet"
         return False, "not better: " + "; ".join(text for _, text in shadow_checks)
     if candidate["average_precision"] is None:
-        return False, "holdout has no attacks"
+        return False, "holdout has no incidents"
     ap_c, ap_i = candidate["average_precision"], incumbent["average_precision"] or 0
     fp_c, fp_i = candidate["false_positives"], incumbent["false_positives"]
     bound = false_alarm_bound(fp_i)
@@ -374,7 +374,7 @@ def score_with(dump, rows):
 
 def wrong_on(dump, rows, threshold=0.65):
     """How many of these labelled events the model gets wrong at the alert
-    line: an attack below it, or a benign event at or above it."""
+    line: an incident below it, or a normal event at or above it."""
     return sum(1 for r, s in zip(rows, score_with(dump, rows)) if (s >= threshold) != bool(int(r["label"])))
 
 
@@ -412,13 +412,13 @@ def guard(ch, since_hours=24):
     earlier = next((h["version"] for h in history[1:] if h["version"] != current), None)
     stats = ch.rows(
         "SELECT countIf(why_selected = 'model_alert') AS reviewed, "
-        "countIf(why_selected = 'model_alert' AND verdict = 'benign' AND confidence >= 0.8) AS benign "
+        "countIf(why_selected = 'model_alert' AND verdict = 'normal' AND confidence >= 0.8) AS false_alarms "
         "FROM watchtower.event_reviews WHERE ml_model = {v:String} "
         "AND reviewed_at > now() - toIntervalHour({h:UInt32})", v=current, h=since_hours)[0]
-    reviewed, benign = int(stats["reviewed"]), int(stats["benign"])
-    if reviewed < GUARD_MIN_REVIEWED or benign / reviewed <= GUARD_MAX_FALSE_ALARMS or earlier is None:
+    reviewed, false_alarms = int(stats["reviewed"]), int(stats["false_alarms"])
+    if reviewed < GUARD_MIN_REVIEWED or false_alarms / reviewed <= GUARD_MAX_FALSE_ALARMS or earlier is None:
         return None
-    reason = (f"rollback: the reviewer called {benign} of {reviewed} of {current}'s own alerts benign "
+    reason = (f"rollback: the reviewer called {false_alarms} of {reviewed} of {current}'s own alerts normal "
               f"in {since_hours} h")
     activate(ch, earlier, reason)
     return {"from": current, "to": earlier, "reason": reason}
@@ -428,10 +428,10 @@ def run(ch=None):
     """The whole daily step. Returns a report; raises only on real errors."""
     ch = ch or ClickHouse()
     rows = dataset(ch)
-    attacks = sum(int(r["label"]) for r in rows)
-    if len(rows) < MIN_ROWS or attacks < MIN_ATTACKS:
-        return {"status": "skipped", "reason": f"{len(rows)} labelled rows, {attacks} attacks "
-                                                f"(need {MIN_ROWS} / {MIN_ATTACKS})"}
+    incidents = sum(int(r["label"]) for r in rows)
+    if len(rows) < MIN_ROWS or incidents < MIN_INCIDENTS:
+        return {"status": "skipped", "reason": f"{len(rows)} labelled rows, {incidents} incidents "
+                                                f"(need {MIN_ROWS} / {MIN_INCIDENTS})"}
     train_rows, test_rows = split(rows)
     booster = train(train_rows)
     labels = [int(r["label"]) for r in test_rows]

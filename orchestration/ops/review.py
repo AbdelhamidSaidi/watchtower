@@ -6,13 +6,13 @@ becomes a training label (orchestration/ops/training.py) -- and that starts
 a retraining, so the model learns from its mistakes within the hour.
 
 It learns in both directions:
-    near_miss    allowed, with the highest model scores: just under the line
-    unusual      allowed, but extreme for the hour on a behaviour feature
-    random       allowed, a uniform sample: misses nothing else would find,
+    near_miss    passed (ok), with the highest model scores: just under the line
+    unusual      passed, but extreme for the hour on a behaviour feature
+    random       passed, a uniform sample: misses nothing else would find,
                  and an honest estimate of the miss rate
-                 -> judged malicious/suspicious: a missed attack, label 1
+                 -> judged degraded/incident: a missed incident, label 1
     model_alert  alerted by the MODEL alone (no rule fired)
-                 -> judged benign: the model's false alarm, label 0
+                 -> judged normal: the model's false alarm, label 0
 Rule decisions are not reviewed: they are explicit and tuned by hand.
 
 Capped per run and per day, so cost is bounded whatever the traffic does.
@@ -49,34 +49,37 @@ BATCH = 10                      # at most this many events per page
 PER_RUN = {"near_miss": 50, "unusual": 50, "random": 30, "model_alert": 20}
 PER_DAY = 3_000
 # Confident enough to become a training label (training.REVIEW_MIN_CONFIDENCE
-# is the same bar) -- and to page someone at once when it says malicious.
+# is the same bar) -- and to page someone at once when it says incident.
 LABEL_CONFIDENCE = training.REVIEW_MIN_CONFIDENCE
 ALERT_CONFIDENCE = 0.9
 
-BEHAVIOUR = ("failed_logins_5m", "unique_users_5m", "unique_ports_5m", "port_scan_count_5m",
-             "http_404_1m", "sensitive_commands_5m", "attack_signatures_5m", "bytes_sent_5m")
+BEHAVIOUR = ("failed_builds_5m", "unique_projects_5m", "oom_kills_5m", "slow_steps_5m",
+             "dependency_404_1m", "rogue_commands_5m", "failure_signatures_5m", "published_bytes_5m")
 
-SYSTEM_PROMPT = """You are a SOC analyst reviewing an automated detector's decisions \
-on security events. Each event was either ALLOWED, or ALERTED by the detector's \
-machine-learning model with no rule behind it. For each, decide what it really is.
+SYSTEM_PROMPT = """You are a build-infrastructure engineer reviewing an automated detector's \
+decisions on build-farm events. Each event was either PASSED (ok), or ALERTED by the \
+detector's machine-learning model with no rule behind it. For each, decide what it really is.
 
-Each line gives the source (internal or external IP, time of day), its recent \
-behaviour (failed logins, distinct accounts, ports, 404s, bytes sent over 1-5 \
-minutes), the event itself, the model's score (0-1) and the detector's decision.
+Each line gives the runner (internal or external, time of day), its recent behaviour \
+(failed builds, distinct projects, OOM kills, slow steps, 404s on dependencies, \
+published MB over 1-5 minutes), the event itself, the model's score (0-1) and the \
+detector's decision.
 
 Judge behaviour, not a single field:
-- many failed logins against one account -> brute force
-- failed logins across many accounts -> password spraying
-- many distinct ports touched -> port scanning; from an internal host -> lateral movement
-- a successful login right after many failures -> possible compromise
-- injection or traversal payloads in a URL, a scanner's user agent -> attack
-- reading /etc/shadow or ~/.ssh, adding users, clearing history -> compromise
-- a normal browser pulling hundreds of MB from an export endpoint -> exfiltration
-Busy is not bad: backup jobs, monitoring, CI runners and VPN users are loud and \
-legitimate; the backup job runs as root. Do not flag volume, 404s or uid 0 alone.
+- many failed builds of ONE project -> a retry loop on a broken commit: the code, not the farm
+- failed builds across many projects on one runner -> a broken toolchain or full disk: the runner
+- exit 137 or "Killed" repeatedly, memory pinned -> an OOM-kill storm
+- compile steps taking 6+ minutes where the project's usual is seconds -> a compile-time regression
+- a flood of 404s on dependency paths -> a bad lockfile or registry outage
+- "checksum mismatch", a corrupt cache entry, "internal compiler error" -> infrastructure fault
+- a miner, `curl ... | sh`, credentials read or sent out, a mirror nobody uses -> a rogue build step
+- uploads of hundreds of MB, never failing -> runaway artifacts
+Busy is not bad: the CI farm is loud and healthy, builds start and fail all day, and \
+containers run as root. Do not flag volume, an ordinary compile error, a failing test or \
+uid 0 alone.
 
 Reply with ONLY a JSON object:
-{"verdicts": [{"id": "<id>", "verdict": "benign|suspicious|malicious", \
+{"verdicts": [{"id": "<id>", "verdict": "normal|degraded|incident", \
 "confidence": <0.0-1.0>, "reason": "<max 20 words>"}]}
 Include every id exactly once."""
 
@@ -91,17 +94,18 @@ def api_key():
 
 # --- candidates --------------------------------------------------------------------
 
-_COLUMNS = ("toString(event_id) AS event_id, timestamp, source_ip, user, event_type, hostname, "
-            "is_internal_ip, is_night, requests_1m, failed_logins_1m, failed_logins_5m, unique_users_5m, "
-            "port_scan_count_5m, unique_ports_5m, commands_executed_5m, http_404_1m, sensitive_commands_5m, "
-            "attack_signatures_5m, bytes_sent_5m, http_method, url_path, http_status, bytes_sent, user_agent, "
-            "command, process_uid, parent_process, file_path, file_operation, auth_method, dest_ip, dest_port, "
+_COLUMNS = ("toString(event_id) AS event_id, timestamp, runner_ip, project, event_type, hostname, "
+            "is_internal_ip, is_night, events_1m, failed_builds_1m, failed_builds_5m, unique_projects_5m, "
+            "oom_kills_5m, distinct_exit_codes_5m, compile_steps_5m, dependency_404_1m, rogue_commands_5m, "
+            "failure_signatures_5m, published_bytes_5m, slow_steps_5m, cache_misses_5m, http_method, url_path, "
+            "http_status, bytes_sent, command, process_uid, parent_process, step, file_path, duration_ms, "
+            "peak_memory_mb, cache_status, error_message, exit_code, reason, triggered_by, dest_ip, "
             "rule_hits, ml_score, ml_reason, ml_model, recommended_action")
 _WINDOW = ("timestamp >= toDateTime64({start:String}, 3, 'UTC') "
            "AND timestamp < toDateTime64({end:String}, 3, 'UTC') "
            "AND event_id NOT IN (SELECT event_id FROM watchtower.event_reviews "
            "                     WHERE reviewed_at > now() - INTERVAL 2 DAY)")
-_HOUR = _WINDOW + " AND recommended_action = 'allow'"
+_HOUR = _WINDOW + " AND recommended_action = 'ok'"
 # Alerted by the model alone: ml_reason is set only when the model raised
 # the decision, and no rule fired.
 _MODEL_ALERTS = _WINDOW + " AND recommended_action = 'alert' AND ml_reason != '' AND rule_hits = ''"
@@ -112,13 +116,13 @@ def reviewed_today(ch):
 
 
 def candidates(ch, start, end, caps=None):
-    """Up to caps[kind] allowed events of the hour per kind, no event twice."""
+    """Up to caps[kind] passed events of the hour per kind, no event twice."""
     caps = dict(caps or PER_RUN)
     params = {"start": start, "end": end}
     extremes = " OR ".join(f"{f} >= q.{f}" for f in BEHAVIOUR)
     quantiles = ", ".join(f"quantile(0.999)({f}) AS {f}" for f in BEHAVIOUR)
     queries = {
-        # Highest model scores that still were allowed.
+        # Highest model scores that still passed.
         "near_miss": f"SELECT {_COLUMNS} FROM watchtower.security_events "
                      f"WHERE {_HOUR} AND ml_score > 0.2 ORDER BY ml_score DESC LIMIT {{n:UInt32}}",
         # Extreme for this hour on any behaviour feature (its top 0.1%).
@@ -163,25 +167,31 @@ def describe(row):
     where = "internal" if row.get("is_internal_ip") else "external"
     when = "night" if row.get("is_night") else "working hours"
     kind = row.get("event_type", "")
-    if kind == "HTTP_REQUEST":
+    project = row.get("project") or "?"
+    if kind in ("DEPENDENCY_FETCH", "ARTIFACT_PUBLISH"):
         event = (f"{row.get('http_method', '')} {(row.get('url_path') or '')[:120]} -> {row.get('http_status')}, "
-                 f"{int(row.get('bytes_sent') or 0):,} bytes, agent '{(row.get('user_agent') or '')[:60]}'")
-    elif kind == "COMMAND_EXECUTION":
-        event = (f"ran `{(row.get('command') or '')[:100]}` as uid {row.get('process_uid')} "
-                 f"(parent {row.get('parent_process') or '?'})")
-    elif kind == "FILE_ACCESS":
-        event = f"{row.get('file_operation') or 'accessed'} {row.get('file_path') or '?'} as uid {row.get('process_uid')}"
-    elif kind in ("LOGIN_SUCCESS", "LOGIN_FAILURE"):
-        outcome = "succeeded" if kind == "LOGIN_SUCCESS" else "failed"
-        event = f"{row.get('auth_method') or '?'} login as '{row.get('user')}' {outcome} to {row.get('dest_ip') or '?'}"
+                 f"{int(row.get('bytes_sent') or 0):,} bytes")
+    elif kind == "COMPILE_STEP":
+        event = (f"{row.get('step') or 'compile'} `{(row.get('command') or '')[:100]}` of {project} as uid "
+                 f"{row.get('process_uid')} (parent {row.get('parent_process') or '?'}): exit {row.get('exit_code')}, "
+                 f"{int(row.get('duration_ms') or 0) / 1000:.0f}s, {row.get('peak_memory_mb') or 0} MB, "
+                 f"cache {row.get('cache_status') or '?'}")
+    elif kind == "TEST_RUN":
+        event = f"tests of {project}: exit {row.get('exit_code')}, {int(row.get('duration_ms') or 0) / 1000:.0f}s"
+    elif kind in ("BUILD_SUCCESS", "BUILD_FAILURE"):
+        outcome = "succeeded" if kind == "BUILD_SUCCESS" else f"failed ({row.get('reason') or '?'})"
+        event = f"build of {project} {outcome} after {int(row.get('duration_ms') or 0) / 1000:.0f}s"
     else:
-        event = f"{kind} to {row.get('dest_ip') or '?'}:{row.get('dest_port') or 0}"
-    text = (f"{where} IP {row['source_ip']}, {when}: {row.get('requests_1m', 0)} events/min, "
-            f"{row.get('failed_logins_1m', 0)} failed logins/min, {row.get('failed_logins_5m', 0)}/5min, "
-            f"{row.get('unique_users_5m', 0)} accounts, {row.get('unique_ports_5m', 0)} ports, "
-            f"{row.get('http_404_1m', 0)} 404s/min, {float(row.get('bytes_sent_5m') or 0) / 1e6:.0f} MB/5min. "
+        event = f"{kind} of {project}"
+    if row.get("error_message"):
+        event += f", error: '{row['error_message'][:100]}'"
+    text = (f"{where} runner {row['runner_ip']}, {when}: {row.get('events_1m', 0)} events/min, "
+            f"{row.get('failed_builds_1m', 0)} failed builds/min, {row.get('failed_builds_5m', 0)}/5min, "
+            f"{row.get('unique_projects_5m', 0)} projects, {row.get('oom_kills_5m', 0)} OOM kills, "
+            f"{row.get('slow_steps_5m', 0)} slow steps, {row.get('dependency_404_1m', 0)} 404s/min, "
+            f"{float(row.get('published_bytes_5m') or 0) / 1e6:.0f} MB published/5min. "
             f"Event: {event}. Model score {float(row.get('ml_score') or 0):.2f}, "
-            f"decision: {row.get('recommended_action', 'allow')}")
+            f"decision: {row.get('recommended_action', 'ok')}")
     if row.get("rule_hits"):
         text += f", rules matched: {row['rule_hits']}"
     return text
@@ -300,7 +310,7 @@ def ask(batch, key, post=_post, retries=6, sleep=time.sleep):
         try:
             index = int(v["id"])
             verdict = str(v["verdict"]).lower()
-            if verdict in ("benign", "suspicious", "malicious") and 0 <= index < len(batch):
+            if verdict in ("normal", "degraded", "incident") and 0 <= index < len(batch):
                 verdicts[index] = (verdict, max(0.0, min(1.0, float(v["confidence"]))), str(v.get("reason", ""))[:300])
         except (KeyError, TypeError, ValueError):
             continue
@@ -340,7 +350,7 @@ def review(rows, key, run_id, post=_post, sleep=time.sleep, clock=time.monotonic
             row = batch[index]
             out.append({
                 "run_id": run_id, "event_id": row["event_id"], "event_time": row["timestamp"],
-                "source_ip": row["source_ip"], "event_type": row["event_type"],
+                "runner_ip": row["runner_ip"], "event_type": row["event_type"],
                 "pipeline_action": row["recommended_action"], "ml_score": float(row.get("ml_score") or 0),
                 "ml_model": row.get("ml_model") or "",
                 "why_selected": row["why_selected"], "verdict": verdict, "confidence": confidence,
@@ -351,15 +361,15 @@ def review(rows, key, run_id, post=_post, sleep=time.sleep, clock=time.monotonic
 
 def labels_from(reviews):
     """Confident disagreements, as training labels, in both directions:
-    an allowed event judged malicious or suspicious is a missed attack (1);
-    a model-only alert judged benign is a false alarm (0)."""
+    a passed event judged degraded or incident is a missed incident (1);
+    a model-only alert judged normal is a false alarm (0)."""
     labels = []
     for r in reviews:
         if r["confidence"] < LABEL_CONFIDENCE:
             continue
-        if r["pipeline_action"] == "allow" and r["verdict"] != "benign":
+        if r["pipeline_action"] == "ok" and r["verdict"] != "normal":
             label = 1
-        elif r["why_selected"] == "model_alert" and r["verdict"] == "benign":
+        elif r["why_selected"] == "model_alert" and r["verdict"] == "normal":
             label = 0
         else:
             continue
@@ -369,7 +379,7 @@ def labels_from(reviews):
 
 
 def urgent(reviews):
-    """Allowed events the reviewer is sure were malicious: someone should
+    """Passed events the reviewer is sure were incidents: someone should
     look now, not after tomorrow's retraining."""
     return [r for r in reviews
-            if r["pipeline_action"] == "allow" and r["verdict"] == "malicious" and r["confidence"] >= ALERT_CONFIDENCE]
+            if r["pipeline_action"] == "ok" and r["verdict"] == "incident" and r["confidence"] >= ALERT_CONFIDENCE]

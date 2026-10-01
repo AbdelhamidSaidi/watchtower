@@ -1,17 +1,23 @@
--- Watchtower analytical storage.
+-- Watchtower analytical storage: build-farm logs.
 -- Runs once, on first initialisation of an empty clickhouse-data volume.
 
 CREATE DATABASE IF NOT EXISTS watchtower;
 
--- Final sink for the ETL pipeline: raw event fields + enrichment +
--- engineered features + per-model scores, one row per security event.
+-- Final sink for the streaming job: raw event fields + enrichment +
+-- rolling features + the detector's scores, one row per build-farm event
+-- (a build starting or finishing, a compiler invocation, a test run, a
+-- dependency fetch, an artifact upload).
+--
+-- The table, topics and schema subject keep the names they had as a
+-- security-log pipeline (security_events, security-logs, ...): the data
+-- changed, the plumbing did not.
 CREATE TABLE IF NOT EXISTS watchtower.security_events
 (
     -- ---- raw event (producer schema) ----------------------------------
     event_id                UUID,
     timestamp               DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-    source_ip               LowCardinality(String),
-    user                    LowCardinality(String),
+    runner_ip               LowCardinality(String),
+    project                 LowCardinality(String),
     event_type              LowCardinality(String),
     hostname                LowCardinality(String),
     severity                LowCardinality(String),
@@ -19,22 +25,21 @@ CREATE TABLE IF NOT EXISTS watchtower.security_events
     -- conditional fields, empty/0 when not applicable to the event_type
     reason                  LowCardinality(String) DEFAULT '',
     command                 String                 DEFAULT '' CODEC(ZSTD(3)),
-    target_port             UInt16                 DEFAULT 0,
+    exit_code               UInt16                 DEFAULT 0,
 
     -- ---- enrichment ---------------------------------------------------
     is_internal_ip          UInt8   DEFAULT 0,
-    country_code            LowCardinality(String) DEFAULT '',
+    region                  LowCardinality(String) DEFAULT '',
 
-    -- ---- engineered features -------------------------------------------
-    failed_logins_1m        UInt32  DEFAULT 0,
-    failed_logins_5m        UInt32  DEFAULT 0,
-    unique_source_ips_5m    UInt32  DEFAULT 0,
-    unique_users_5m         UInt32  DEFAULT 0,
-    requests_1m             UInt32  DEFAULT 0,
-    port_scan_count_5m      UInt32  DEFAULT 0,
-    unique_ports_5m         UInt32  DEFAULT 0,
-    commands_executed_5m    UInt32  DEFAULT 0,
-    login_frequency         Float32 DEFAULT 0,
+    -- ---- engineered features: the runner's last 1 and 5 minutes --------
+    events_1m               UInt32  DEFAULT 0,
+    failed_builds_1m        UInt32  DEFAULT 0,
+    failed_builds_5m        UInt32  DEFAULT 0,
+    unique_projects_5m      UInt32  DEFAULT 0,
+    oom_kills_5m            UInt32  DEFAULT 0,
+    distinct_exit_codes_5m  UInt32  DEFAULT 0,
+    compile_steps_5m        UInt32  DEFAULT 0,
+    build_frequency         Float32 DEFAULT 0,
     hour                    UInt8   DEFAULT 0,
     is_night                UInt8   DEFAULT 0,
 
@@ -45,24 +50,25 @@ CREATE TABLE IF NOT EXISTS watchtower.security_events
     -- so an alert can be explained without re-running anything; ml_model
     -- is the model version (watchtower.ml_models).
     -- final_anomaly_score = max(rule_score, ml_score), the model's share
-    -- capped below `block` unless a rule agrees (WATCHTOWER_ML_CAN_BLOCK).
+    -- capped below `quarantine` unless a rule agrees
+    -- (WATCHTOWER_ML_CAN_QUARANTINE). is_suspicious = flagged: alert or worse.
     rule_score              Float32 DEFAULT 0,
     rule_hits               LowCardinality(String) DEFAULT '',
-    recommended_action      LowCardinality(String) DEFAULT 'allow',
+    recommended_action      LowCardinality(String) DEFAULT 'ok',
     ml_score                Float32 DEFAULT 0,
     ml_reason               String  DEFAULT '',
     ml_model                LowCardinality(String) DEFAULT '',
     final_anomaly_score     Float32 DEFAULT 0,
     is_suspicious           UInt8   DEFAULT 0,
 
-    -- ---- v2: request / network / process / file context --------------
+    -- ---- context: build, registry, process, step -----------------------
     log_source              LowCardinality(String) DEFAULT '',
     outcome                 LowCardinality(String) DEFAULT '',
-    session_id              String DEFAULT '',
+    build_id                String DEFAULT '',
     dest_ip                 String DEFAULT '',
     dest_port               UInt16 DEFAULT 0,
     protocol                LowCardinality(String) DEFAULT '',
-    auth_method             LowCardinality(String) DEFAULT '',
+    triggered_by            LowCardinality(String) DEFAULT '',
     http_method             LowCardinality(String) DEFAULT '',
     url_path                String DEFAULT '' CODEC(ZSTD(3)),
     http_status             UInt16 DEFAULT 0,
@@ -74,22 +80,29 @@ CREATE TABLE IF NOT EXISTS watchtower.security_events
     parent_process          LowCardinality(String) DEFAULT '',
     -- -1 = unknown. 0 is root, so it cannot double as "not reported".
     process_uid             Int32 DEFAULT -1,
+    step                    LowCardinality(String) DEFAULT '',
     file_path               String DEFAULT '',
-    file_operation          LowCardinality(String) DEFAULT '',
-    -- ---- v2: indicators -- why an event looks bad, one column each -----
-    request_signature       LowCardinality(String) DEFAULT '',
-    is_attack_signature     UInt8 DEFAULT 0,
-    is_scanner_agent        UInt8 DEFAULT 0,
-    is_sensitive_path       UInt8 DEFAULT 0,
-    is_sensitive_command    UInt8 DEFAULT 0,
+    duration_ms             UInt32 DEFAULT 0,
+    peak_memory_mb          UInt32 DEFAULT 0,
+    cache_status            LowCardinality(String) DEFAULT '',
+    error_message           String DEFAULT '' CODEC(ZSTD(3)),
+    -- ---- indicators -- why an event looks wrong, one column each --------
+    failure_signature       LowCardinality(String) DEFAULT '',
+    is_failure_signature    UInt8 DEFAULT 0,
+    is_untrusted_fetch      UInt8 DEFAULT 0,
+    is_rogue_command        UInt8 DEFAULT 0,
     is_privileged           UInt8 DEFAULT 0,
-    -- ---- v2: rolling features ------------------------------------------
-    sensitive_commands_5m   UInt32 DEFAULT 0,
-    attack_signatures_5m    UInt32 DEFAULT 0,
+    is_slow_step            UInt8 DEFAULT 0,
+    is_cache_miss           UInt8 DEFAULT 0,
+    -- ---- more rolling features -------------------------------------------
+    rogue_commands_5m       UInt32 DEFAULT 0,
+    failure_signatures_5m   UInt32 DEFAULT 0,
     http_errors_5m          UInt32 DEFAULT 0,
-    http_404_1m             UInt32 DEFAULT 0,
-    distinct_paths_5m       UInt32 DEFAULT 0,
-    bytes_sent_5m           UInt64 DEFAULT 0,
+    dependency_404_1m       UInt32 DEFAULT 0,
+    distinct_artifacts_5m   UInt32 DEFAULT 0,
+    published_bytes_5m      UInt64 DEFAULT 0,
+    slow_steps_5m           UInt32 DEFAULT 0,
+    cache_misses_5m         UInt32 DEFAULT 0,
 
     -- ---- lineage ---------------------------------------------------------
     ingested_at             DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta, ZSTD(1)),
@@ -109,29 +122,29 @@ CREATE TABLE IF NOT EXISTS watchtower.security_events
 ENGINE = ReplacingMergeTree
 PARTITION BY toDate(timestamp)
 -- WHY THIS KEY (measured on 43M events, tools/bench_queries.py):
---   The old key, (timestamp, source_ip, event_id), led with a near-unique
+--   The old key, (timestamp, runner_ip, event_id), led with a near-unique
 --   millisecond timestamp, so the columns after it never narrowed a read:
---   "this IP" and "this event_id" scanned the whole table (1 GB, 43M rows).
+--   "this runner" and "this event_id" scanned the whole table (1 GB, 43M rows).
 --   Bucketing time into 10 minutes first keeps time-range pruning, and
---   inside each bucket one IP's events sit together:
---     one IP, whole history   43M rows / 1 GB  ->  1M rows / 5 MB
---     one IP, +-15 min         2M rows / 101 MB -> 68K rows / 1 MB
---     event by id (bloom)     43M rows / 683 MB -> 65K rows / 3 MB
+--   inside each bucket one runner's events sit together:
+--     one runner, whole history   43M rows / 1 GB  ->  1M rows / 5 MB
+--     one runner, +-15 min         2M rows / 101 MB -> 68K rows / 1 MB
+--     event by id (bloom)         43M rows / 683 MB -> 65K rows / 3 MB
 --   ReplacingMergeTree deduplicates on this key; a redelivered event has
---   the same bucket, source_ip, timestamp and event_id, so it still collapses.
-ORDER BY (toStartOfTenMinutes(timestamp), source_ip, timestamp, event_id)
+--   the same bucket, runner_ip, timestamp and event_id, so it still collapses.
+ORDER BY (toStartOfTenMinutes(timestamp), runner_ip, timestamp, event_id)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
--- Suspicious events only: small, and what a dashboard hits most often.
--- `recommended_action` is the work queue: action = 'block' is what must be
--- stopped, with rule_hits and the request/command saying why.
+-- Flagged events only: small, and what a dashboard hits most often.
+-- `recommended_action` is the work queue: action = 'quarantine' is a runner
+-- to pull out of the farm, with rule_hits and the command or error saying why.
 CREATE TABLE IF NOT EXISTS watchtower.suspicious_events
 (
     event_id                UUID,
     timestamp               DateTime64(3, 'UTC'),
-    source_ip               String,
-    user                    LowCardinality(String),
+    runner_ip               String,
+    project                 LowCardinality(String),
     event_type              LowCardinality(String),
     hostname                LowCardinality(String),
     recommended_action      LowCardinality(String),
@@ -141,7 +154,7 @@ CREATE TABLE IF NOT EXISTS watchtower.suspicious_events
     ml_reason               String,
     final_anomaly_score     Float32,
     url_path                String,
-    user_agent              String,
+    error_message           String,
     command                 String,
     process_uid             Int32
 )
@@ -150,11 +163,7 @@ PARTITION BY toDate(timestamp)
 ORDER BY (timestamp, final_anomaly_score)
 TTL toDateTime(timestamp) + INTERVAL 90 DAY;
 
--- The materialized view feeding this table is created in
--- 02_v2_request_context.sql, AFTER that file adds the v2 columns. It cannot
--- live here: ClickHouse analyses a view's SELECT even under IF NOT EXISTS,
--- so on a volume created before v2 the statement fails on columns the
--- table does not have yet.
+-- The materialized view feeding this table is created in 02_views.sql.
 
 -- Rows clean.py refused, kept with the original bytes so a dropped log is
 -- auditable rather than invisible. A rising count here is a health signal.

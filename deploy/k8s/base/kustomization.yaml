@@ -40,8 +40,7 @@ configMapGenerator:
   - name: clickhouse-init
     files:
       - 01_schema.sql=../../../clickhouse/init/01_schema.sql
-      - 01b_ml_columns.sql=../../../clickhouse/init/01b_ml_columns.sql
-      - 02_v2_request_context.sql=../../../clickhouse/init/02_v2_request_context.sql
+      - 02_views.sql=../../../clickhouse/init/02_views.sql
       - 03_streaming_ingest.sql=../../../clickhouse/init/03_streaming_ingest.sql
       - 04_orchestration.sql=../../../clickhouse/init/04_orchestration.sql
       - 05_ml.sql=../../../clickhouse/init/05_ml.sql

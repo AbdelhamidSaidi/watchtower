@@ -4,7 +4,7 @@ Watchtower streaming job: every event decided the moment it arrives.
     Kafka security-logs
       -> parse+validate+normalize+enrich   (per event, no state)
            \\-> rejected  -> Kafka security-logs-rejected -> rejected_events
-      -> keyBy(source_ip)
+      -> keyBy(runner_ip)
       -> dedup + rolling features + rules  (per event, keyed state)
       -> Kafka security-events-scored -> ClickHouse Kafka engine -> security_events
 
@@ -173,7 +173,7 @@ TIMER_BUCKET_MS = 60 * 1000
 
 class FlinkWindowStore:
     """RollingWindow's storage (see core/window.MemoryStore) over Flink
-    keyed state, scoped to the current source_ip by Flink itself.
+    keyed state, scoped to the current runner_ip by Flink itself.
 
     Every read or write here is a Python -> JVM call (~4 us in thread
     mode), and state calls were the largest single cost per event (~70 of
@@ -181,11 +181,11 @@ class FlinkWindowStore:
 
       * one small SUMMARY value per source holds the running sums, the
         window positions, the record at each window head, and -- while
-        they are small -- the distinct user/port/path counts;
+        they are small -- the distinct project/exit-code/artifact counts;
       * window RECORDS are a map (one entry per event: written once, read
         once when it leaves a window);
-      * a count dict that grows past INLINE_COUNTS entries (a scanner
-        hitting hundreds of paths) moves to its own map state, so the
+      * a count dict that grows past INLINE_COUNTS entries (a runner
+        hitting hundreds of artifacts) moves to its own map state, so the
         summary never becomes the whole-window blob that the first version
         re-serialised on every event.
 
@@ -391,7 +391,7 @@ def _wall_clock_ms(ctx):
 class DetectPerSource(KeyedProcessFunction):
     clock = staticmethod(_wall_clock_ms)
 
-    """Dedup, rolling features and rules, with one SourceState per source_ip."""
+    """Dedup, rolling features and rules, with one SourceState per runner_ip."""
 
     def open(self, runtime_context):
         def value(name):
@@ -404,8 +404,8 @@ class DetectPerSource(KeyedProcessFunction):
             value("window_summary"),
             mapping("window_records", Types.LONG(), Types.PICKLED_BYTE_ARRAY()),
             {
-                "users": mapping("window_users", Types.STRING(), Types.INT()),
-                "ports": mapping("window_ports", Types.INT(), Types.INT()),
+                "projects": mapping("window_projects", Types.STRING(), Types.INT()),
+                "codes": mapping("window_codes", Types.INT(), Types.INT()),
                 "paths": mapping("window_paths", Types.STRING(), Types.INT()),
             },
         )
@@ -419,7 +419,7 @@ class DetectPerSource(KeyedProcessFunction):
         self.scored = BatchedCounter(group, "scored_events")
         self.duplicates = BatchedCounter(group, "duplicate_events")
         self.forgotten = BatchedCounter(group, "idle_sources_cleared")
-        self.actions = {a: BatchedCounter(group, f"action_{a}") for a in ("allow", "alert", "block")}
+        self.actions = {a: BatchedCounter(group, f"action_{a}") for a in ("ok", "alert", "quarantine")}
         self.dq = IssueCounters(group, ("features", "rules"))
         # Events whose decision the model raised above what the rules said.
         self.ml_raised = BatchedCounter(group, "ml_raised")
@@ -466,7 +466,7 @@ class DetectPerSource(KeyedProcessFunction):
         # millisecond). Registered only when the target minute changes: the
         # summary remembers the one already set, which spares the ~20 us
         # timer-service call on almost every event.
-        check_at = _idle_check_at(now, event["source_ip"])
+        check_at = _idle_check_at(now, event["runner_ip"])
         if summary.get("idle_check_at") != check_at:
             ctx.timer_service().register_processing_time_timer(check_at)
             summary["idle_check_at"] = check_at
@@ -503,7 +503,7 @@ def build(raw, versions, detect_parallelism=None):
     source and sinks live in main(); tests feed a collection instead.
 
     ORDER. Features assume one source's events arrive in event-time order.
-    That holds because the producer keys Kafka messages by source_ip (one
+    That holds because the producer keys Kafka messages by runner_ip (one
     source = one partition = one source subtask), and parsing runs chained
     to the source at the same parallelism -- so every event of a source
     reaches the keyed operator through one path. Parsing at a different
@@ -515,7 +515,7 @@ def build(raw, versions, detect_parallelism=None):
     # the graph is, which is what checkpoint restore needs.
     parsed = raw.process(ParseValidate(versions)).name("parse-validate-enrich")
     scored = (
-        parsed.key_by(lambda event: event["source_ip"], key_type=Types.STRING())
+        parsed.key_by(lambda event: event["runner_ip"], key_type=Types.STRING())
         .process(DetectPerSource(), output_type=Types.STRING())
         .name("dedup-features-rules")
     )

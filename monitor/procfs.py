@@ -70,7 +70,7 @@ SERVICES = (
     ("flink-jobmanager", lambda name, cmd: "ClusterEntryPoint" in cmd or "ClusterEntrypoint" in cmd),
     ("clickhouse", lambda name, cmd: name.startswith("clickhouse")),
     ("schema-registry", lambda name, cmd: "karapace" in cmd),
-    ("producer", lambda name, cmd: "security_log_producer" in cmd),
+    ("producer", lambda name, cmd: "build_log_producer" in cmd),
     ("monitor", lambda name, cmd: " -m monitor" in cmd),
     ("prometheus", lambda name, cmd: name == "prometheus"),
     ("grafana", lambda name, cmd: name.startswith("grafana")),

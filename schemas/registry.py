@@ -40,7 +40,7 @@ HEADER_SIZE = 5
 DEFAULT_SUBJECT = "security-logs-value"
 DEFAULT_COMPATIBILITY = "BACKWARD"
 
-SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "security_event.avsc")
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_event.avsc")
 
 _CONTENT_TYPE = "application/vnd.schemaregistry.v1+json"
 

@@ -8,8 +8,8 @@ cache off; the report is the
 median of rows read, bytes read, time and memory, from system.query_log --
 ClickHouse's own accounting, not client-side timing.
 
-The queries are the ones people run: the SOC analyst's investigation queries
-(NOTE_TO_SOC_ANALYST.md), the detection evaluator (tools/evaluate_detection.py),
+The queries are the ones people run: the build engineer's investigation queries
+(NOTE_TO_BUILD_ENGINEER.md), the detection evaluator (tools/evaluate_detection.py),
 and the operational latency check (make latency). Time windows are anchored on
 the newest event in the table, so the benchmark works on historical data.
 """
@@ -36,9 +36,9 @@ def ch(query):
 def workload(t):
     anchor = ch(f"SELECT max(timestamp) FROM watchtower.{t}")
     ip, eid = ch(
-        f"SELECT source_ip, toString(event_id) FROM watchtower.{t} "
+        f"SELECT runner_ip, toString(event_id) FROM watchtower.{t} "
         f"WHERE timestamp > toDateTime64('{anchor}', 3) - INTERVAL 2 HOUR "
-        f"AND recommended_action = 'block' LIMIT 1 FORMAT TSV"
+        f"AND recommended_action = 'quarantine' LIMIT 1 FORMAT TSV"
     ).split("\t")
     a = f"toDateTime64('{anchor}', 3)"
     newest_ingest = ch(f"SELECT max(ingested_at) FROM watchtower.{t}")
@@ -46,18 +46,18 @@ def workload(t):
         "event by id (alert drill-down)":
             f"SELECT * FROM watchtower.{t} WHERE event_id = '{eid}'",
         "one IP, +-15 min (investigation)":
-            f"SELECT timestamp, event_type, user, failed_logins_5m, unique_ports_5m, ml_score, ml_reason "
-            f"FROM watchtower.{t} WHERE source_ip = '{ip}' "
+            f"SELECT timestamp, event_type, project, failed_builds_5m, distinct_exit_codes_5m, ml_score, ml_reason "
+            f"FROM watchtower.{t} WHERE runner_ip = '{ip}' "
             f"AND timestamp > {a} - INTERVAL 45 MINUTE AND timestamp < {a} - INTERVAL 15 MINUTE ORDER BY timestamp",
         "one IP, whole history":
-            f"SELECT count(), countIf(recommended_action = 'block'), min(timestamp), max(timestamp) "
-            f"FROM watchtower.{t} WHERE source_ip = '{ip}'",
+            f"SELECT count(), countIf(recommended_action = 'quarantine'), min(timestamp), max(timestamp) "
+            f"FROM watchtower.{t} WHERE runner_ip = '{ip}'",
         "last 10 min, model-driven alerts":
             f"SELECT count() FROM watchtower.{t} WHERE timestamp > {a} - INTERVAL 10 MINUTE "
             f"AND ml_reason != ''",
-        "top blocked IPs, last hour":
-            f"SELECT source_ip, count() c FROM watchtower.{t} WHERE timestamp > {a} - INTERVAL 1 HOUR "
-            f"AND recommended_action = 'block' GROUP BY source_ip ORDER BY c DESC LIMIT 10",
+        "top quarantined IPs, last hour":
+            f"SELECT runner_ip, count() c FROM watchtower.{t} WHERE timestamp > {a} - INTERVAL 1 HOUR "
+            f"AND recommended_action = 'quarantine' GROUP BY runner_ip ORDER BY c DESC LIMIT 10",
         "evaluator, last 15 min":
             f"SELECT event_id, recommended_action, rule_hits FROM watchtower.{t} "
             f"WHERE timestamp > {a} - INTERVAL 15 MINUTE FORMAT Null",

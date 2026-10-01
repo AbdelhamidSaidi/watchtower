@@ -1,6 +1,6 @@
-"""The rolling 5-minute window of one source -- the behavioural features.
+"""The rolling 5-minute window of one runner -- the behavioural features.
 
-Engine-free: Flink keeps one RollingWindow per source_ip in keyed state
+Engine-free: Flink keeps one RollingWindow per runner_ip in keyed state
 (stream/job.py FlinkWindowStore); the tests use MemoryStore.
 """
 
@@ -10,43 +10,52 @@ WINDOW_5M_MS = 5 * 60 * 1000
 
 # (column, ClickHouse-compatible kind), in output order.
 FEATURES = [
-    ("requests_1m", "int"),
-    ("failed_logins_1m", "int"),
-    ("failed_logins_5m", "int"),
-    ("unique_source_ips_5m", "int"),  # always 0: keyed by source_ip, it cannot see other sources (docs/context.md)
-    ("unique_users_5m", "int"),
-    ("port_scan_count_5m", "int"),
-    ("unique_ports_5m", "int"),
-    ("commands_executed_5m", "int"),
-    ("login_frequency", "float"),
-    # v2 -- read from request / process context, not just counts
-    ("sensitive_commands_5m", "int"),  # closes the privilege-escalation gap
-    ("attack_signatures_5m", "int"),
+    ("events_1m", "int"),
+    ("failed_builds_1m", "int"),
+    ("failed_builds_5m", "int"),
+    ("unique_projects_5m", "int"),         # a runner failing across many projects is itself broken
+    ("oom_kills_5m", "int"),
+    ("distinct_exit_codes_5m", "int"),
+    ("compile_steps_5m", "int"),
+    ("build_frequency", "float"),
+    ("rogue_commands_5m", "int"),
+    ("failure_signatures_5m", "int"),      # the infrastructure's errors, not the code's
     ("http_errors_5m", "int"),
-    ("http_404_1m", "int"),             # directory brute force
-    ("distinct_paths_5m", "int"),
-    ("bytes_sent_5m", "long"),          # exfiltration
+    ("dependency_404_1m", "int"),          # a build hunting for artifacts that are not there
+    ("distinct_artifacts_5m", "int"),
+    ("published_bytes_5m", "long"),        # runaway uploads
+    ("slow_steps_5m", "int"),
+    ("cache_misses_5m", "int"),
 ]
 
 # The fields of one window record, in order.
 RECORD_FIELDS = [
-    "ts_ms", "event_types", "ports", "users", "statuses", "sizes", "paths",
-    "sensitive", "signatures",
+    "ts_ms", "event_types", "exit_codes", "projects", "statuses", "sizes", "paths",
+    "rogue", "signatures", "oom", "slow", "misses",
 ]
+
+OOM_EXIT_CODE = 137  # 128 + SIGKILL: what the kernel's OOM killer sends
 
 
 def record_of(event, ts_ms):
     """The window record for one normalized, enriched event."""
+    event_type = event.get("event_type") or ""
+    exit_code = int(event.get("exit_code") or 0)
     return (
         ts_ms,
-        event.get("event_type") or "",
-        int(event.get("target_port") or 0),
-        event.get("user") or "",
+        event_type,
+        exit_code,
+        event.get("project") or "",
         int(event.get("http_status") or 0),
-        int(event.get("bytes_sent") or 0),
+        # Only uploads count towards the bytes a runner pushes at the
+        # artifact store; a download is the registry's cost, not the store's.
+        int(event.get("bytes_sent") or 0) if event_type == "ARTIFACT_PUBLISH" else 0,
         event.get("url_path") or "",
-        int(event.get("is_sensitive_command") or 0),
-        int(event.get("is_attack_signature") or 0),
+        int(event.get("is_rogue_command") or 0),
+        int(event.get("is_failure_signature") or 0),
+        int(event.get("failure_signature") == "oom" or exit_code == OOM_EXIT_CODE),
+        int(event.get("is_slow_step") or 0),
+        int(event.get("is_cache_miss") or 0),
     )
 
 
@@ -62,11 +71,12 @@ SUMMARY_FIELDS = [
     "head5", "head1", "tail", "newest",
     # the record AT each head, cached: an eviction check costs no store read
     "head1_record", "head5_record",
-    "failed_5m", "scans_5m", "commands_5m", "logins_5m", "sensitive_5m",
-    "signatures_5m", "errors_5m", "bytes_5m", "failed_1m", "not_found_1m",
-    "n_users", "n_ports", "n_paths",
+    "failed_5m", "oom_5m", "compiles_5m", "builds_5m", "rogue_5m",
+    "signatures_5m", "errors_5m", "bytes_5m", "slow_5m", "misses_5m",
+    "failed_1m", "not_found_1m",
+    "n_projects", "n_codes", "n_paths",
 ]
-COUNTED = ("users", "ports", "paths")
+COUNTED = ("projects", "codes", "paths")
 
 
 def new_summary():
@@ -106,7 +116,7 @@ class MemoryStore:
 
 
 class RollingWindow:
-    """One source's last 5 minutes, with RUNNING aggregates.
+    """One runner's last 5 minutes, with RUNNING aggregates.
 
     Every new event adds itself to the counters; every event that falls out
     of a window subtracts itself. Cost per event is O(1) amortised,
@@ -119,14 +129,14 @@ class RollingWindow:
     test_features.py keeps that brute-force version as a reference and
     checks this one against it on random event streams.
 
-    Assumes per-source events arrive in event-time order, which the pipeline
-    guarantees: the producer keys by source_ip, so one source is one Kafka
+    Assumes per-runner events arrive in event-time order, which the pipeline
+    guarantees: the producer keys by runner_ip, so one runner is one Kafka
     partition. A late event is evaluated as of the newest time already seen
     -- the window never moves backwards.
     """
 
     # records are tuples, in RECORD_FIELDS order
-    _TS, _TYPE, _PORT, _USER, _STATUS, _SIZE, _PATH, _SENSITIVE, _SIG = range(9)
+    _TS, _TYPE, _CODE, _PROJECT, _STATUS, _SIZE, _PATH, _ROGUE, _SIG, _OOM, _SLOW, _MISS = range(12)
 
     def __init__(self, store=None):
         self.store = store if store is not None else MemoryStore()
@@ -141,23 +151,25 @@ class RollingWindow:
 
     def _apply5(self, m, r, sign):
         kind = r[self._TYPE]
-        m["failed_5m"] += sign * (kind == "LOGIN_FAILURE")
-        m["scans_5m"] += sign * (kind == "PORT_SCAN")
-        m["commands_5m"] += sign * (kind == "COMMAND_EXECUTION")
-        m["logins_5m"] += sign * (kind in ("LOGIN_SUCCESS", "LOGIN_FAILURE"))
-        m["sensitive_5m"] += sign * r[self._SENSITIVE]
+        m["failed_5m"] += sign * (kind == "BUILD_FAILURE")
+        m["oom_5m"] += sign * r[self._OOM]
+        m["compiles_5m"] += sign * (kind == "COMPILE_STEP")
+        m["builds_5m"] += sign * (kind in ("BUILD_SUCCESS", "BUILD_FAILURE"))
+        m["rogue_5m"] += sign * r[self._ROGUE]
         m["signatures_5m"] += sign * r[self._SIG]
         m["errors_5m"] += sign * (r[self._STATUS] >= 400)
         m["bytes_5m"] += sign * r[self._SIZE]
-        if r[self._USER]:
-            self._count(m, "users", r[self._USER], sign)
-        if r[self._PORT] > 0:
-            self._count(m, "ports", r[self._PORT], sign)
+        m["slow_5m"] += sign * r[self._SLOW]
+        m["misses_5m"] += sign * r[self._MISS]
+        if r[self._PROJECT]:
+            self._count(m, "projects", r[self._PROJECT], sign)
+        if r[self._CODE] > 0:
+            self._count(m, "codes", r[self._CODE], sign)
         if r[self._PATH]:
             self._count(m, "paths", r[self._PATH], sign)
 
     def _apply1(self, m, r, sign):
-        m["failed_1m"] += sign * (r[self._TYPE] == "LOGIN_FAILURE")
+        m["failed_1m"] += sign * (r[self._TYPE] == "BUILD_FAILURE")
         m["not_found_1m"] += sign * (r[self._STATUS] == 404)
 
     def add(self, record):
@@ -196,22 +208,23 @@ class RollingWindow:
             m["head5_record"] = store.get_record(m["head5"])
 
         return {
-            "requests_1m": m["tail"] - m["head1"],
-            "failed_logins_1m": m["failed_1m"],
-            "failed_logins_5m": m["failed_5m"],
-            "unique_source_ips_5m": 0,  # keyed by source_ip: see docs/context.md
-            "unique_users_5m": m["n_users"],
-            "port_scan_count_5m": m["scans_5m"],
-            "unique_ports_5m": m["n_ports"],
-            "commands_executed_5m": m["commands_5m"],
-            # events per minute across the 5m window
-            "login_frequency": float(m["logins_5m"]) / 5.0,
-            "sensitive_commands_5m": m["sensitive_5m"],
-            "attack_signatures_5m": m["signatures_5m"],
+            "events_1m": m["tail"] - m["head1"],
+            "failed_builds_1m": m["failed_1m"],
+            "failed_builds_5m": m["failed_5m"],
+            "unique_projects_5m": m["n_projects"],
+            "oom_kills_5m": m["oom_5m"],
+            "distinct_exit_codes_5m": m["n_codes"],
+            "compile_steps_5m": m["compiles_5m"],
+            # builds finished per minute across the 5m window
+            "build_frequency": float(m["builds_5m"]) / 5.0,
+            "rogue_commands_5m": m["rogue_5m"],
+            "failure_signatures_5m": m["signatures_5m"],
             "http_errors_5m": m["errors_5m"],
-            "http_404_1m": m["not_found_1m"],
-            "distinct_paths_5m": m["n_paths"],
-            "bytes_sent_5m": int(m["bytes_5m"]),
+            "dependency_404_1m": m["not_found_1m"],
+            "distinct_artifacts_5m": m["n_paths"],
+            "published_bytes_5m": int(m["bytes_5m"]),
+            "slow_steps_5m": m["slow_5m"],
+            "cache_misses_5m": m["misses_5m"],
         }
 
     def records(self):

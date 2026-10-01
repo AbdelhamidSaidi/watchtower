@@ -4,7 +4,7 @@
 --   watchtower_pipeline           every 10 min -> pipeline_health
 --   watchtower_data_quality       hourly  -> data_quality_checks
 --   watchtower_daily              daily   -> daily_summary, daily_rule_hits,
---                                            daily_top_sources
+--                                            daily_top_sources (runners)
 --   watchtower_detection_quality  6-hourly -> detection_quality
 --
 -- The daily tables are PARTITIONED BY DAY so a day is rebuilt idempotently:
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS watchtower.daily_summary
     event_type          LowCardinality(String),
     recommended_action  LowCardinality(String),
     events              UInt64,
-    sources             UInt64,
+    runners             UInt64,
     suspicious          UInt64,
     built_at            DateTime DEFAULT now()
 )
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS watchtower.daily_rule_hits
     rule                LowCardinality(String),
     recommended_action  LowCardinality(String),
     events              UInt64,
-    sources             UInt64,
+    runners             UInt64,
     built_at            DateTime DEFAULT now()
 )
 ENGINE = MergeTree
@@ -85,13 +85,13 @@ PARTITION BY day
 ORDER BY (day, rule, recommended_action)
 TTL day + INTERVAL 400 DAY;
 
--- The day's most-blocked sources: the SOC's morning list.
+-- The day's most-quarantined runners: the build team's morning list.
 CREATE TABLE IF NOT EXISTS watchtower.daily_top_sources
 (
     day          Date,
-    source_ip    String,
+    runner_ip    String,
     events       UInt64,
-    blocked      UInt64,
+    quarantined  UInt64,
     alerted      UInt64,
     first_seen   DateTime64(3, 'UTC'),
     last_seen    DateTime64(3, 'UTC'),
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS watchtower.daily_top_sources
 )
 ENGINE = MergeTree
 PARTITION BY day
-ORDER BY (day, blocked, source_ip)
+ORDER BY (day, quarantined, runner_ip)
 TTL day + INTERVAL 400 DAY;
 
 -- Detection quality against the synthetic producer's ground truth
@@ -112,14 +112,14 @@ CREATE TABLE IF NOT EXISTS watchtower.detection_quality
     window_minutes              UInt16,
     events                      UInt64,
     coverage                    Nullable(Float64),
-    attacks_seen                UInt32,
-    attacks_caught              UInt32,
-    attack_events_flagged       Nullable(Float64),
-    attack_events_blocked       Nullable(Float64),
-    normal_blocked              UInt64,
-    normal_blocked_uninvolved   UInt64,
+    incidents_seen              UInt32,
+    incidents_caught            UInt32,
+    incident_events_flagged     Nullable(Float64),
+    incident_events_quarantined Nullable(Float64),
+    normal_quarantined          UInt64,
+    normal_quarantined_uninvolved UInt64,
     normal_events               UInt64,
-    precision_block             Nullable(Float64),
+    precision_quarantine        Nullable(Float64),
     median_time_to_flag_s       Nullable(Float64),
     passed                      UInt8,
     failures                    Array(String),

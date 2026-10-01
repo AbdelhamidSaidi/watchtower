@@ -93,8 +93,8 @@ jobs:
       - name: Register the base schema
         run: |
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
-          if git cat-file -e "$BASE:schemas/security_event.avsc" 2>/dev/null; then
-            git show "$BASE:schemas/security_event.avsc" > /tmp/base.avsc
+          if git cat-file -e "$BASE:schemas/build_event.avsc" 2>/dev/null; then
+            git show "$BASE:schemas/build_event.avsc" > /tmp/base.avsc
             python3 tools/schema_registry.py register --url http://localhost:8081 --schema-file /tmp/base.avsc
           else
             echo "no schema on the base commit -- nothing to be compatible with"

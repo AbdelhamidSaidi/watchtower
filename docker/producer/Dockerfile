@@ -20,4 +20,4 @@ USER 10001
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "producer/security_log_producer.py"]
+CMD ["python", "producer/build_log_producer.py"]

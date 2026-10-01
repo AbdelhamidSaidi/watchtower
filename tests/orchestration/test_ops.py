@@ -136,9 +136,9 @@ def test_reconcile_reports_both_counts():
 
 def report(**summary):
     base = {
-        "coverage": 1.0, "attacks_seen": 29, "attacks_caught": 29, "attack_flagged": 0.993,
-        "attack_blocked": 0.993, "normal_events": 868_112, "normal_blocked": 297,
-        "normal_blocked_uninvolved": 7, "precision_block": 0.975, "median_time_to_flag_s": 1.1,
+        "coverage": 1.0, "incidents_seen": 29, "incidents_caught": 29, "incident_flagged": 0.993,
+        "incident_quarantined": 0.993, "normal_events": 868_112, "normal_quarantined": 297,
+        "normal_quarantined_uninvolved": 7, "precision_quarantine": 0.975, "median_time_to_flag_s": 1.1,
     }
     return {"window": {"minutes": 15, "events": 879_721}, "summary": {**base, **summary}}
 
@@ -149,24 +149,24 @@ def test_the_measured_flink_run_passes():
 
 @pytest.mark.parametrize("summary, expected", [
     ({"coverage": 0.99}, "coverage"),
-    ({"attacks_caught": 28}, "1 of 29 attacks never flagged"),
+    ({"incidents_caught": 28}, "1 of 29 incidents never flagged"),
     ({"median_time_to_flag_s": 12.0}, "median time to first flag"),
-    ({"normal_blocked_uninvolved": 200}, "uninvolved hosts"),
+    ({"normal_quarantined_uninvolved": 200}, "uninvolved runners"),
 ])
 def test_each_threshold_can_fail_the_run(summary, expected):
     failures = detection.assess(report(**summary))
     assert len(failures) == 1 and expected in failures[0]
 
 
-def test_a_window_without_attacks_is_not_judged_on_them():
-    assert detection.assess(report(attacks_seen=0, attacks_caught=0, attack_flagged=None,
+def test_a_window_without_incidents_is_not_judged_on_them():
+    assert detection.assess(report(incidents_seen=0, incidents_caught=0, incident_flagged=None,
                                    median_time_to_flag_s=None)) == []
 
 
-def test_few_attack_events_flagged_is_reported_not_failed():
-    # Two small attacks, both caught within 1.5 s: their pre-threshold
-    # events are 8% of all attack events. Measured in dev, 2026-09-27.
-    assert detection.assess(report(attacks_seen=2, attacks_caught=2, attack_flagged=0.9188,
+def test_few_incident_events_flagged_is_reported_not_failed():
+    # Two small incidents, both caught within 1.5 s: their pre-threshold
+    # events are 8% of all incident events. Measured in dev, 2026-09-27.
+    assert detection.assess(report(incidents_seen=2, incidents_caught=2, incident_flagged=0.9188,
                                    median_time_to_flag_s=1.07)) == []
 
 
@@ -179,4 +179,4 @@ def test_an_empty_window_fails():
 def test_row_carries_the_verdict_and_the_whole_report():
     row = detection.row(report(), ["x"], "manual__1")
     assert row["passed"] == 0 and row["failures"] == ["x"] and row["run_id"] == "manual__1"
-    assert '"normal_blocked_uninvolved": 7' in row["report"]
+    assert '"normal_quarantined_uninvolved": 7' in row["report"]

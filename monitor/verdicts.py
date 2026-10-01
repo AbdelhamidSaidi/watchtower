@@ -24,9 +24,9 @@ FROM watchtower.data_quality_checks
 WHERE run_id = (SELECT argMax(run_id, checked_at) FROM watchtower.data_quality_checks)"""
 
 DETECTION = """
-SELECT toUnixTimestamp64Milli(evaluated_at) AS at, window_minutes, events, coverage, attacks_seen,
-       attacks_caught, attack_events_flagged, attack_events_blocked, normal_blocked_uninvolved,
-       normal_events, precision_block, median_time_to_flag_s, passed, report
+SELECT toUnixTimestamp64Milli(evaluated_at) AS at, window_minutes, events, coverage, incidents_seen,
+       incidents_caught, incident_events_flagged, incident_events_quarantined, normal_quarantined_uninvolved,
+       normal_events, precision_quarantine, median_time_to_flag_s, passed, report
 FROM watchtower.detection_quality ORDER BY evaluated_at DESC LIMIT 1"""
 
 
@@ -71,12 +71,12 @@ class AirflowVerdicts:
             summary = json.loads(r["report"]).get("summary", {}) if r["report"] else {}
             metrics = gauge("watchtower_detection_eval",
                             "The latest 6-hourly detection evaluation (watchtower_detection_quality DAG).")
-            for name in ("coverage", "attack_events_flagged", "attack_events_blocked", "precision_block",
+            for name in ("coverage", "incident_events_flagged", "incident_events_quarantined", "precision_quarantine",
                          "median_time_to_flag_s"):
                 metrics.add(r[name], metric=name)
             metrics.add(summary.get("model_only_precision"), metric="model_only_precision")
             counts = gauge("watchtower_detection_eval_events", "Counts from the latest detection evaluation.")
-            for name in ("events", "attacks_seen", "attacks_caught", "normal_blocked_uninvolved", "normal_events"):
+            for name in ("events", "incidents_seen", "incidents_caught", "normal_quarantined_uninvolved", "normal_events"):
                 counts.add(r[name], kind=name)
             counts.add(summary.get("model_only_flags"), kind="model_only_flags")
             f += [metrics, counts,

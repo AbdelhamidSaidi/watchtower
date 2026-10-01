@@ -6,7 +6,7 @@ workflow is a `make` target; `make help` lists them.
 For what the system is and why it is built this way, see
 [`context.md`](context.md); for the live, per-event path (Flink) and its
 latency, [`streaming.md`](streaming.md). For tuning detection, see
-[`NOTE_TO_SOC_ANALYST.md`](../NOTE_TO_SOC_ANALYST.md).
+[`NOTE_TO_BUILD_ENGINEER.md`](../NOTE_TO_BUILD_ENGINEER.md).
 
 ---
 
@@ -64,6 +64,38 @@ intake recreated (its columns cannot be altered):
 make ch-migrate && make ch-recreate-ingest
 ```
 
+### Switching an existing install to build logs
+
+On 2026-10-01 the events changed from security logs to build-farm
+(compilation) logs. The topics, tables and the registry subject kept their
+names; **their contents and columns did not**: `source_ip` became
+`runner_ip`, `user` became `project`, the login/port/HTTP features became build
+features, the actions became `ok` / `alert` / `quarantine`. Four things on an
+install that predates this cannot simply carry on:
+
+| what | why it cannot carry on |
+|---|---|
+| the registered schema | the old `SecurityEvent` has required fields the new `BuildEvent` lacks; BACKWARD compatibility refuses the new one (HTTP 409) |
+| messages already in `security-logs` | they carry the old schema's id; once the subject is replaced they are rejected as `unknown_schema_version` |
+| `security_events` and the other tables | the columns differ; `CREATE TABLE IF NOT EXISTS` will not change an existing table |
+| Flink's checkpoints | the keyed state holds old window records with a different layout |
+
+The clean way in dev, when the old data is not wanted (it is synthetic):
+
+```bash
+make dev-down
+docker compose down -v      # DELETES the Kafka, ClickHouse, Flink-checkpoint and Airflow volumes
+make dev-up                 # schema-init registers build_event.avsc; ClickHouse runs clickhouse/init/*.sql
+docker compose --profile sim up -d producer
+```
+
+`make secrets` is not needed again: `secrets/` is untouched. To keep the old
+rows for reference, set the old tables aside in ClickHouse before the wipe
+(`CREATE TABLE ... AS`, or `clickhouse-client` `BACKUP`) -- nothing in the
+pipeline reads them any more. On Kubernetes the same applies to the ClickHouse
+volume, the Kafka topics, the registry subject and the Flink job's state;
+that path has not been run.
+
 Detection needs no key: rules and the model run in the stream. The hourly
 LLM review (Airflow, `watchtower_review`) is skipped until you add a Groq
 key; Airflow reads it on the next run:
@@ -82,7 +114,7 @@ make test-flink     # + the job on a local Flink mini-cluster
 make test           # test-flink + test-airflow: every suite
 make test-airflow   # DAGs parse and are wired as documented; ops, training, reviewer
 make ci             # lint + tests + render both overlays
-make evaluate       # detection vs ground truth, per attack type (dev)
+make evaluate       # detection vs ground truth, per incident type (dev)
 ```
 
 Tests run **inside the test stage of the Flink image** (unit, the job, lint)
@@ -92,8 +124,9 @@ Python and libraries as production.
 | suite | what it proves |
 |---|---|
 | `unit/test_processor` | decode → validate → normalize → enrich → dedup → features → rules, per event; every reject reason |
-| `unit/test_rules` | each attack blocked with its reason; benign look-alikes allowed |
-| `unit/test_ml` | the compiled model gives LightGBM's own numbers; the model may alert but not block alone; hot-swap and kill switch |
+| `unit/test_rules` | each incident quarantined with its reason; benign look-alikes left `ok` |
+| `unit/test_ml` | the compiled model gives LightGBM's own numbers; the model may alert but not quarantine alone; hot-swap and kill switch |
+| `unit/test_simulation` | the simulator replayed through the per-event path (`tools/replay_offline.py`): every kind of incident flagged by the rules, no uninvolved runner ever flagged |
 | `unit/test_dq` | a clean event passes every step boundary; each doubtful case is named where it appears |
 | `unit/test_config`, `test_registry` | secrets from files, never printed; the wire format and registry client |
 | `flink/` | the real job on a local Flink mini-cluster: operators, keyed state, side output, both execution modes |
@@ -142,7 +175,7 @@ The wire format is Avro, registered in a Confluent-compatible registry
 **Refused:** adding a field without a default, changing a type, renaming.
 
 ```bash
-# 1. edit schemas/security_event.avsc
+# 1. edit schemas/build_event.avsc
 make schema-check              # against the dev registry
 # 2. register it (CI does this through the same CLI)
 python3 tools/schema_registry.py register --url http://localhost:8081
@@ -232,12 +265,12 @@ deployed for auto-rebalance) can raise it on a live topic.
 ## 6b. ClickHouse migrations
 
 **security_events layout** (`01_schema.sql`): sorted by
-`(toStartOfTenMinutes(timestamp), source_ip, timestamp, event_id)` with
+`(toStartOfTenMinutes(timestamp), runner_ip, timestamp, event_id)` with
 bloom-filter (event_id) and min/max (timestamp, ingested_at) skip indexes.
 An existing install moves onto it with `make ch-relayout` (writers stopped
 first; copies hour by hour, swaps atomically, keeps the old table as
 `security_events_before_relayout` until you drop it). `make ch-bench`
-measures the analyst/evaluator/latency queries against any table.
+measures the engineer/evaluator/latency queries against any table.
 
 Measured on 43M events: one event by id 683 MB → 3 MB read; one IP's whole
 history 1 GB → 5 MB; one IP ±15 min 101 MB → 1 MB; the latency check
@@ -322,7 +355,7 @@ Open Prometheus (`make prometheus` → `/alerts`) or Grafana (`make grafana`).
 | `StreamJobDown` | Flink JobManager unreachable | `kubectl get flinkdeployment stream`; operator logs |
 | `StreamFallingBehind` | > 10,000 events waiting in Kafka for 5 min | the autoscaler should be adding TaskManagers -- if not, it is at its ceiling or pods are Pending |
 | `StreamLatencyHigh` | Kafka → decision p95 > 2 s for 5 min | Flink UI: busy / backpressured time per operator |
-| `StreamDataQualityDegraded` | > 1% of events doubtful after normalize/enrich for 10 min (blank users, unknown severities, unplaced IPs, clock skew) | the Grafana panel *Data quality between steps* says which issue; usually one log source changed format |
+| `StreamDataQualityDegraded` | > 1% of events doubtful after normalize/enrich for 10 min (blank projects, unknown severities, unplaced runners, clock skew) | the Grafana panel *Data quality between steps* says which issue; usually one build tool changed its log format |
 | `StreamLogicInconsistent` | **critical** — features or a decision contradicting themselves | a detection bug or corrupted state: compare with the last green test run; restore from a savepoint (§9) |
 | `StreamRejectingEvents` | the job rejected messages in the last 10 min | `SELECT reject_reason, count() FROM rejected_events GROUP BY 1` |
 | `KafkaUnderReplicatedPartitions` | a broker lagging or down | `make status` |
@@ -340,7 +373,7 @@ no one. Adding one Alertmanager Deployment routes them to Slack or email.
 ## 9. Recovery
 
 **Streaming job crash** — Flink restarts it from the newest checkpoint
-(offsets + every source's window and dedup memory, taken every 10 s).
+(offsets + every runner's window and dedup memory, taken every 10 s).
 On Kubernetes the operator does this with Kubernetes HA; in dev,
 `docker/flink/run-job.sh` finds the newest complete checkpoint when the
 JobManager container restarts. Nothing to do.

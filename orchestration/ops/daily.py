@@ -9,7 +9,7 @@ scanning a day of events:
 
     daily_summary      events per type and decision (additive)
     daily_rule_hits    events per rule and decision
-    daily_top_sources  the 50 most-blocked sources
+    daily_top_sources  the 50 most-quarantined runners
 
 Every step is idempotent: running a day twice, or backfilling a month,
 gives the same tables.
@@ -80,17 +80,17 @@ def deduplicate(ch, day):
 
 
 SUMMARY = f"""
-INSERT INTO watchtower.daily_summary (day, event_type, recommended_action, events, sources, suspicious)
+INSERT INTO watchtower.daily_summary (day, event_type, recommended_action, events, runners, suspicious)
 SELECT toDate(timestamp) AS d, event_type, recommended_action,
-       count(), uniqExact(source_ip), countIf(is_suspicious = 1)
+       count(), uniqExact(runner_ip), countIf(is_suspicious = 1)
 FROM {EVENTS} FINAL
 WHERE {DAY}
 GROUP BY d, event_type, recommended_action
 """
 
 RULE_HITS = f"""
-INSERT INTO watchtower.daily_rule_hits (day, rule, recommended_action, events, sources)
-SELECT toDate(timestamp) AS d, rule, recommended_action, count(), uniqExact(source_ip)
+INSERT INTO watchtower.daily_rule_hits (day, rule, recommended_action, events, runners)
+SELECT toDate(timestamp) AS d, rule, recommended_action, count(), uniqExact(runner_ip)
 FROM {EVENTS} FINAL
 ARRAY JOIN splitByChar(',', toString(rule_hits)) AS rule
 WHERE {DAY} AND rule_hits != ''
@@ -99,9 +99,9 @@ GROUP BY d, rule, recommended_action
 
 TOP = f"""
 INSERT INTO watchtower.daily_top_sources
-    (day, source_ip, events, blocked, alerted, first_seen, last_seen, rules)
-SELECT toDate(timestamp) AS d, toString(source_ip) AS ip, count(),
-       countIf(recommended_action = 'block') AS blocked,
+    (day, runner_ip, events, quarantined, alerted, first_seen, last_seen, rules)
+SELECT toDate(timestamp) AS d, toString(runner_ip) AS ip, count(),
+       countIf(recommended_action = 'quarantine') AS quarantined,
        countIf(recommended_action = 'alert') AS alerted,
        min(timestamp), max(timestamp),
        arraySort(arrayFilter(r -> r != '',
@@ -109,8 +109,8 @@ SELECT toDate(timestamp) AS d, toString(source_ip) AS ip, count(),
 FROM {EVENTS} FINAL
 WHERE {DAY}
 GROUP BY d, ip
-HAVING blocked + alerted > 0
-ORDER BY blocked DESC, alerted DESC, ip
+HAVING quarantined + alerted > 0
+ORDER BY quarantined DESC, alerted DESC, ip
 LIMIT {TOP_SOURCES}
 """
 

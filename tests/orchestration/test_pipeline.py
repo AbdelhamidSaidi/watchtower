@@ -161,11 +161,11 @@ def test_rejected_results_count_as_written():
 # --- data quality between the steps ------------------------------------------------
 
 def test_doubtful_events_warn_with_the_culprits_named():
-    dq = {"scored": 1000.0, "normalize_missing_user": 50.0, "enrich_unknown_country": 5.0,
+    dq = {"scored": 1000.0, "normalize_missing_project": 50.0, "enrich_unknown_region": 5.0,
           "features_window_inconsistent": 0.0}
     r = by_name(pipeline.judge_transform(sample(dq=dq)))
     assert r["doubtful_share"]["value"] == 0.055 and not r["doubtful_share"]["passed"]
-    assert "normalize_missing_user 50, enrich_unknown_country 5" in r["doubtful_share"]["detail"]
+    assert "normalize_missing_project 50, enrich_unknown_region 5" in r["doubtful_share"]["detail"]
     assert pipeline.failures(list(r.values())) == []          # a warning, not a failure
 
 
@@ -184,18 +184,18 @@ def test_dq_counters_sum_every_subtask():
     answers = {
         pipeline.FLINK_REST_URL + "/jobs/overview": jobs("RUNNING"),
         base: {"vertices": [{"id": "v1"}, {"id": "v2"}]},
-        base + "/vertices/v1/metrics": [{"id": "0.parse.watchtower.dq_normalize_missing_user"},
-                                        {"id": "1.parse.watchtower.dq_normalize_missing_user"},
+        base + "/vertices/v1/metrics": [{"id": "0.parse.watchtower.dq_normalize_missing_project"},
+                                        {"id": "1.parse.watchtower.dq_normalize_missing_project"},
                                         {"id": "0.parse.numRecordsIn"}],
-        base + "/vertices/v1/metrics?get=0.parse.watchtower.dq_normalize_missing_user,"
-               "1.parse.watchtower.dq_normalize_missing_user":
-            [{"id": "0.parse.watchtower.dq_normalize_missing_user", "value": "3"},
-             {"id": "1.parse.watchtower.dq_normalize_missing_user", "value": "4"}],
+        base + "/vertices/v1/metrics?get=0.parse.watchtower.dq_normalize_missing_project,"
+               "1.parse.watchtower.dq_normalize_missing_project":
+            [{"id": "0.parse.watchtower.dq_normalize_missing_project", "value": "3"},
+             {"id": "1.parse.watchtower.dq_normalize_missing_project", "value": "4"}],
         base + "/vertices/v2/metrics": [{"id": "0.rules.watchtower.scored_events"}],
         base + "/vertices/v2/metrics?get=0.rules.watchtower.scored_events":
             [{"id": "0.rules.watchtower.scored_events", "value": "900"}],
     }
-    assert pipeline.dq_counters(answers.__getitem__) == {"normalize_missing_user": 7.0, "scored": 900.0}
+    assert pipeline.dq_counters(answers.__getitem__) == {"normalize_missing_project": 7.0, "scored": 900.0}
 
 
 class FakeClickHouse:

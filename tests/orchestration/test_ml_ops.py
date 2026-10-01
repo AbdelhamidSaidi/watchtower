@@ -20,7 +20,7 @@ from orchestration.ops import review, training
 def row(label, i, reviewed=False, **features):
     event = {f: 0.0 for f in ml.FEATURES}
     event.update(features)
-    return {**event, "event_id": f"e{i}", "event_type": "LOGIN_FAILURE", "rule_score": 0.0, "rule_hits": "",
+    return {**event, "event_id": f"e{i}", "event_type": "BUILD_FAILURE", "rule_score": 0.0, "rule_hits": "",
             "label": label, "weight": 1.0, "reviewed": reviewed}
 
 
@@ -28,11 +28,11 @@ def synthetic(n=3000, seed=5):
     rng = random.Random(seed)
     rows = []
     for i in range(n):
-        attack = rng.random() < 0.1
-        rows.append(row(int(attack), i,
-                        failed_logins_5m=rng.randint(20, 60) if attack else rng.randint(0, 6),
-                        unique_users_5m=rng.randint(5, 20) if attack else rng.randint(1, 2),
-                        requests_1m=rng.randint(1, 80)))
+        incident = rng.random() < 0.1
+        rows.append(row(int(incident), i,
+                        failed_builds_5m=rng.randint(20, 60) if incident else rng.randint(0, 6),
+                        unique_projects_5m=rng.randint(5, 20) if incident else rng.randint(1, 2),
+                        events_1m=rng.randint(1, 80)))
     return rows
 
 
@@ -59,7 +59,7 @@ def holdout(ap, fp):
     (holdout(0.9999, 2), holdout(0.9991, 0), (0, 3), True),     # measured 2026-09-28: noise, and it fixed the AI's 3
     (holdout(0.95, 3), holdout(0.95, 0), None, True),            # 3 of ~1,500 after 0: within chance
     (holdout(0.95, 8), holdout(0.95, 0), None, False),           # 8 after 0: not chance
-    (holdout(0.90, 0), holdout(0.95, 0), None, False),           # ranks attacks worse
+    (holdout(0.90, 0), holdout(0.95, 0), None, False),           # ranks incidents worse
     (holdout(0.99, 0), holdout(0.95, 0), (2, 1), False),         # unlearned a correction
 ])
 def test_promotion_needs_a_model_at_least_as_good(candidate, incumbent, reviewed, promoted):
@@ -117,13 +117,13 @@ def test_normal_events_are_sampled_per_source_and_weighted_back_to_the_real_coun
     for i in range(1000):
         sampler.add("10.0.0.1", f"busy{i}")          # a monitoring agent
     for i in range(3):
-        sampler.add("102.67.14.54", f"vpn{i}")       # a quiet remote user
+        sampler.add("102.67.14.54", f"spot{i}")      # a quiet cloud runner
     rows = sampler.rows()
     by_source = {}
     for r in rows:
         by_source.setdefault(r["event_id"][:3], []).append(r["weight"])
     assert len(by_source["bus"]) == 5 and sum(by_source["bus"]) == 1000
-    assert len(by_source["vpn"]) == 3 and sum(by_source["vpn"]) == 3   # the quiet host is kept, whole
+    assert len(by_source["spo"]) == 3 and sum(by_source["spo"]) == 3   # the quiet host is kept, whole
 
 
 def test_a_reviewer_label_weighs_half_a_typical_sampled_row():
@@ -138,7 +138,7 @@ def test_a_reviewer_label_weighs_half_a_typical_sampled_row():
     ({"rows": 20000, "candidate_alerts": 60, "incumbent_alerts": 10}, False),     # six times the active model
     ({"rows": 0, "candidate_alerts": 0, "incumbent_alerts": None}, True),        # no recent traffic: not judged
 ])
-def test_the_shadow_check_refuses_a_model_that_would_flood_the_soc(shadowed, promoted):
+def test_the_shadow_check_refuses_a_model_that_would_flood_the_on_call(shadowed, promoted):
     good = {"average_precision": 0.99, "false_positives": 0}
     assert training.better(good, good, None, shadowed)[0] is promoted
 
@@ -157,7 +157,7 @@ def test_the_shadow_sample_counts_hosts():
     pytest.importorskip("lightgbm")
     rows = synthetic(2000)
     dump = training.train(rows).dump_model()
-    traffic = [r | {"source_ip": f"10.0.0.{i % 7}"} for i, r in enumerate(rows) if not r["label"]]
+    traffic = [r | {"runner_ip": f"10.0.0.{i % 7}"} for i, r in enumerate(rows) if not r["label"]]
     out = training.shadow(dump, dump, traffic)
     assert out["sources"] == 7 and out["candidate_alerts"] == out["incumbent_alerts"]
     assert out["candidate_sources"] == out["incumbent_sources"] <= 7
@@ -175,12 +175,12 @@ def test_too_little_data_is_a_skip_not_a_bad_model():
 
 # --- review --------------------------------------------------------------------------
 
-EVENT = {"event_id": "u1", "timestamp": "2026-09-28 10:00:00.000", "source_ip": "102.67.14.98",
-         "event_type": "LOGIN_SUCCESS", "user": "sara", "auth_method": "password", "dest_ip": "10.0.0.5",
-         "is_internal_ip": 0, "is_night": 1, "requests_1m": 30, "failed_logins_1m": 8,
-         "failed_logins_5m": 26, "unique_users_5m": 1, "unique_ports_5m": 0, "http_404_1m": 0,
-         "bytes_sent_5m": 0, "rule_hits": "", "ml_score": 0.61, "recommended_action": "allow",
-         "why_selected": "near_miss"}
+EVENT = {"event_id": "u1", "timestamp": "2026-09-28 10:00:00.000", "runner_ip": "102.67.14.98",
+         "event_type": "BUILD_SUCCESS", "project": "payments-api", "triggered_by": "svc-ci", "dest_ip": "10.0.40.10",
+         "duration_ms": 95_000, "is_internal_ip": 0, "is_night": 1, "events_1m": 30, "failed_builds_1m": 8,
+         "failed_builds_5m": 26, "unique_projects_5m": 1, "oom_kills_5m": 0, "slow_steps_5m": 0,
+         "dependency_404_1m": 0, "published_bytes_5m": 0, "rule_hits": "", "ml_score": 0.61,
+         "recommended_action": "ok", "why_selected": "near_miss"}
 
 
 def groq(verdicts, tokens=2000):
@@ -197,43 +197,43 @@ def groq(verdicts, tokens=2000):
 
 def test_the_reviewer_sees_the_event_in_context():
     text = review.describe(EVENT)
-    assert "external IP 102.67.14.98, night" in text and "26/5min" in text
-    assert "login as 'sara' succeeded" in text and "Model score 0.61" in text
+    assert "external runner 102.67.14.98, night" in text and "26/5min" in text
+    assert "build of payments-api succeeded after 95s" in text and "Model score 0.61" in text
 
 
 def test_verdicts_become_reviews_labels_and_alerts():
-    post = groq([{"id": "0", "verdict": "malicious", "confidence": 0.95, "reason": "success after 26 failures"}])
+    post = groq([{"id": "0", "verdict": "incident", "confidence": 0.95, "reason": "green after 26 failures: flaky, not fixed"}])
     reviews = review.review([EVENT], "key", "run1", post=post)
     body = post.calls[0]
     assert (body["model"], body["reasoning_effort"], body["stream"]) == (
         "openai/gpt-oss-safeguard-20b", "medium", False)
     [r] = reviews
-    assert (r["verdict"], r["pipeline_action"], r["why_selected"]) == ("malicious", "allow", "near_miss")
+    assert (r["verdict"], r["pipeline_action"], r["why_selected"]) == ("incident", "ok", "near_miss")
     [label] = review.labels_from(reviews)
     assert label["label"] == 1 and label["source"] == "reviewer" and label["weight"] < 1
     assert review.urgent(reviews) == reviews
 
 
-def test_a_benign_verdict_on_a_model_only_alert_teaches_the_model_to_be_quieter():
+def test_a_normal_verdict_on_a_model_only_alert_teaches_the_model_to_be_quieter():
     alert = {**EVENT, "recommended_action": "alert", "why_selected": "model_alert", "ml_score": 0.8,
-             "ml_reason": "ml: failed_logins_5m"}
+             "ml_reason": "ml: failed_builds_5m"}
     reviews = review.review([alert], "k", "r", post=groq(
-        [{"id": "0", "verdict": "benign", "confidence": 0.9, "reason": "a VPN user mistyping"}]))
+        [{"id": "0", "verdict": "normal", "confidence": 0.9, "reason": "an ordinary red build on a spot runner"}]))
     [label] = review.labels_from(reviews)
     assert label["label"] == 0 and review.urgent(reviews) == []
 
 
 def test_an_answer_wrapped_in_prose_is_still_read():
-    content = 'Here you go:\n```json\n{"verdicts": [{"id": "0", "verdict": "benign", ' \
+    content = 'Here you go:\n```json\n{"verdicts": [{"id": "0", "verdict": "normal", ' \
               '"confidence": 0.7, "reason": "routine"}]}\n```'
 
     def post(body, key):
         return {"choices": [{"message": {"content": content}}]}
-    assert review.ask([EVENT], "k", post=post)[0] == {0: ("benign", 0.7, "routine")}
+    assert review.ask([EVENT], "k", post=post)[0] == {0: ("normal", 0.7, "routine")}
 
 
-def test_unsure_or_benign_verdicts_teach_nothing():
-    for verdict, confidence in (("suspicious", 0.5), ("benign", 0.99)):
+def test_unsure_or_normal_verdicts_teach_nothing():
+    for verdict, confidence in (("degraded", 0.5), ("normal", 0.99)):
         reviews = review.review([EVENT], "k", "r", post=groq(
             [{"id": "0", "verdict": verdict, "confidence": confidence, "reason": "x"}]))
         assert review.labels_from(reviews) == [] and review.urgent(reviews) == []
@@ -241,7 +241,7 @@ def test_unsure_or_benign_verdicts_teach_nothing():
 
 def test_malformed_or_missing_verdicts_are_dropped_not_guessed():
     post = groq([{"id": "0", "verdict": "probably fine", "confidence": 0.9},
-                 {"id": "7", "verdict": "malicious", "confidence": 0.9},
+                 {"id": "7", "verdict": "incident", "confidence": 0.9},
                  {"id": "0"}])
     assert review.review([EVENT], "k", "r", post=post) == []
 
@@ -318,7 +318,7 @@ def test_what_was_judged_survives_groq_giving_up():
         if len(calls) > 1:
             raise urllib.error.HTTPError("u", 401, "no", {}, None)
         return {"choices": [{"message": {"content": json.dumps({"verdicts": [
-            {"id": "0", "verdict": "benign", "confidence": 0.9, "reason": "x"}]})}}]}
+            {"id": "0", "verdict": "normal", "confidence": 0.9, "reason": "x"}]})}}]}
     reviews = review.review([EVENT] * 15, "k", "r", post=post, sleep=lambda s: None)
     assert len(reviews) == 1 and len(calls) == 2
 
@@ -351,8 +351,8 @@ def test_the_daily_budget(used, caps):
 # --- the guard: automatic rollback ------------------------------------------------------
 
 class GuardClickHouse:
-    def __init__(self, history, reviewed, benign):
-        self.history, self.stats = history, {"reviewed": reviewed, "benign": benign}
+    def __init__(self, history, reviewed, false_alarms):
+        self.history, self.stats = history, {"reviewed": reviewed, "false_alarms": false_alarms}
         self.inserted = []
 
     def rows(self, sql, **params):
@@ -364,20 +364,20 @@ class GuardClickHouse:
         self.inserted.extend(rows)
 
 
-def test_a_model_whose_alerts_are_mostly_benign_is_rolled_back():
-    ch = GuardClickHouse(["v3", "v2", "v1"], reviewed=30, benign=21)
+def test_a_model_whose_alerts_are_mostly_false_alarms_is_rolled_back():
+    ch = GuardClickHouse(["v3", "v2", "v1"], reviewed=30, false_alarms=21)
     rolled = training.guard(ch)
     assert (rolled["from"], rolled["to"]) == ("v3", "v2")
     assert ch.inserted[0]["version"] == "v2" and "21 of 30" in ch.inserted[0]["reason"]
 
 
-@pytest.mark.parametrize("history, reviewed, benign", [
+@pytest.mark.parametrize("history, reviewed, false_alarms", [
     (["v3", "v2"], 30, 12),     # mostly right: kept
     (["v3", "v2"], 10, 9),      # too few reviewed to judge
     (["v1"], 30, 29),           # nothing to roll back to
 ])
-def test_the_guard_leaves_a_model_alone_otherwise(history, reviewed, benign):
-    ch = GuardClickHouse(history, reviewed, benign)
+def test_the_guard_leaves_a_model_alone_otherwise(history, reviewed, false_alarms):
+    ch = GuardClickHouse(history, reviewed, false_alarms)
     assert training.guard(ch) is None and ch.inserted == []
 
 

@@ -10,10 +10,10 @@ fails only if a **fail** check failed.
 |---|---|---|
 | volume | fail | at least one event was stored |
 | rejected_share | fail | ≤ 1% of messages were refused |
-| missing_identity | fail | no event lacks source_ip or event_type |
+| missing_identity | fail | no event lacks runner_ip or event_type |
 | latency_p95_ms | warn | p95 event-to-row ≤ 2 s |
 | duplicate_share | warn | ≤ 1% unmerged replay copies |
-| block_share_vs_7d | warn | block share ≤ 5× the trailing week |
+| quarantine_share_vs_7d | warn | quarantine share ≤ 5× the trailing week |
 
 Prometheus alerts on the pipeline; these check the data it wrote.
 """

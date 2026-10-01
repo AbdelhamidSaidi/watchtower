@@ -41,19 +41,19 @@ def test_a_missing_or_unknown_severity_is_counted_as_defaulted(severity):
     assert "severity_defaulted" in issues
 
 
-def test_a_login_without_a_user():
-    _, issues, _ = through(user="")
-    assert "missing_user" in issues
+def test_a_build_without_a_project():
+    _, issues, _ = through(project="")
+    assert "missing_project" in issues
 
 
-def test_an_http_request_needs_no_user():
-    _, issues, _ = through(user="", event_type="HTTP_REQUEST")
-    assert "missing_user" not in issues
+def test_a_dependency_fetch_needs_no_project():
+    _, issues, _ = through(project="", event_type="DEPENDENCY_FETCH")
+    assert "missing_project" not in issues
 
 
-def test_an_external_address_geoip_cannot_place():
-    _, _, issues = through(source_ip="203.0.113.7")
-    assert "unknown_country" in issues
+def test_an_external_runner_the_inventory_cannot_place():
+    _, _, issues = through(runner_ip="203.0.113.7")
+    assert "unknown_region" in issues
 
 
 @pytest.mark.parametrize("timestamp, issue", [
@@ -66,15 +66,15 @@ def test_event_time_far_from_the_job_clock(timestamp, issue):
 
 
 def test_windows_must_nest():
-    assert dq.after_features({"failed_logins_1m": 3, "failed_logins_5m": 2, "requests_1m": 5}) == \
+    assert dq.after_features({"failed_builds_1m": 3, "failed_builds_5m": 2, "events_1m": 5}) == \
         ("window_inconsistent",)
-    assert dq.after_features({"failed_logins_1m": 0, "failed_logins_5m": 0, "requests_1m": 0}) == \
+    assert dq.after_features({"failed_builds_1m": 0, "failed_builds_5m": 0, "events_1m": 0}) == \
         ("window_inconsistent",)
 
 
 @pytest.mark.parametrize("row, issue", [
-    ({"final_anomaly_score": 1.5, "recommended_action": "block"}, "score_out_of_range"),
-    ({"final_anomaly_score": 0.9, "recommended_action": "allow"}, "action_mismatch"),
+    ({"final_anomaly_score": 1.5, "recommended_action": "quarantine"}, "score_out_of_range"),
+    ({"final_anomaly_score": 0.9, "recommended_action": "ok"}, "action_mismatch"),
 ])
 def test_the_decision_must_follow_the_score(row, issue):
     assert dq.after_rules(row) == (issue,)
@@ -83,6 +83,6 @@ def test_the_decision_must_follow_the_score(row, issue):
 def test_every_named_issue_is_declared():
     # The job registers dq.ISSUES up front so each exports 0 before it fires.
     declared = {i for issues in dq.ISSUES.values() for i in issues}
-    assert {"severity_defaulted", "missing_user", "missing_hostname", "unknown_country",
+    assert {"severity_defaulted", "missing_project", "missing_hostname", "unknown_region",
             "future_timestamp", "stale_timestamp", "window_inconsistent",
             "score_out_of_range", "action_mismatch"} == declared

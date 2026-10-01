@@ -2,15 +2,18 @@
 
 Each rule is (name, score, fired). An event's score is its strongest
 rule's; `rule_hits` lists every rule that fired, strongest first. Scores
-are how sure a rule is: signatures (bad in themselves) score high, a lone
-probe of a sensitive path only alerts. NOTE_TO_SOC_ANALYST.md explains
-each rule and how to tune it.
+are how sure a rule is: signatures (wrong in themselves) score high, a lone
+slow compile step only alerts. NOTE_TO_BUILD_ENGINEER.md explains each rule
+and how to tune it.
+
+The actions are the farm's: `ok` lets the runner carry on, `alert` asks an
+engineer to look, `quarantine` is "stop scheduling builds on this runner".
 """
 
 import os
 import re
 
-BLOCK_THRESHOLD = float(os.getenv("WATCHTOWER_BLOCK_THRESHOLD", "0.85"))
+QUARANTINE_THRESHOLD = float(os.getenv("WATCHTOWER_QUARANTINE_THRESHOLD", "0.85"))
 SUSPICIOUS_THRESHOLD = float(os.getenv("WATCHTOWER_THRESHOLD", "0.65"))
 
 REVERSE_SHELL_REGEX = r"(?i)(?:\bnc\s+-e\b|/dev/tcp/|bash\s+-i\s*>&)"
@@ -21,41 +24,40 @@ def _rules(e):
     """(name, score, fired) for every rule, in table order."""
     n = lambda k: e.get(k) or 0  # noqa: E731
     event_type = e.get("event_type") or ""
-    signature = e.get("request_signature") or ""
-    internal = n("is_internal_ip") == 1
+    signature = e.get("failure_signature") or ""
     return [
-        # --- signatures: bad in themselves --------------------------------
+        # --- signatures: wrong in themselves ------------------------------
         ("reverse_shell", 1.00, bool(_REVERSE_SHELL.search(str(e.get("command") or "")))),
-        ("sensitive_command_as_root", 0.97, n("is_sensitive_command") == 1 and n("is_privileged") == 1),
-        ("sqli", 0.95, signature == "sqli"),
-        ("path_traversal", 0.95, signature == "path_traversal"),
-        ("xss", 0.90, signature == "xss"),
-        ("sensitive_command", 0.85, n("is_sensitive_command") == 1),
-        ("scanner_agent", 0.85, n("is_scanner_agent") == 1),
-        ("sensitive_path_probe", 0.70,
-         n("is_sensitive_path") == 1 and n("http_status") in (401, 403, 404) and not internal),
-        # --- behaviour: the source's recent history ----------------------
-        ("login_after_brute_force", 1.00, event_type == "LOGIN_SUCCESS" and n("failed_logins_5m") >= 20),
-        ("brute_force", 0.90, n("failed_logins_1m") >= 20),
-        ("password_spray", 0.90, n("unique_users_5m") >= 8 and n("failed_logins_5m") >= 20),
-        ("port_scan", 0.90, n("unique_ports_5m") >= 10),
-        ("lateral_movement", 0.90, internal and n("port_scan_count_5m") >= 5),
-        ("web_scan", 0.85, n("http_404_1m") >= 30),
-        ("data_exfiltration", 0.85, n("bytes_sent_5m") >= 250_000_000),
-        ("repeated_attack_signatures", 0.90, n("attack_signatures_5m") >= 5),
+        ("rogue_command_as_root", 0.97, n("is_rogue_command") == 1 and n("is_privileged") == 1),
+        ("cache_poisoned", 0.95, signature == "checksum_mismatch"),
+        ("compiler_crash", 0.95, signature == "ice"),
+        ("disk_full", 0.90, signature == "disk_full"),
+        ("rogue_command", 0.85, n("is_rogue_command") == 1),
+        ("oom_kill", 0.70, signature == "oom"),
+        ("untrusted_fetch", 0.70, n("is_untrusted_fetch") == 1),
+        ("slow_step", 0.70, n("is_slow_step") == 1),
+        # --- behaviour: the runner's recent history ----------------------
+        ("pass_after_failure_storm", 0.70, event_type == "BUILD_SUCCESS" and n("failed_builds_5m") >= 20),
+        ("failure_storm", 0.90, n("failed_builds_1m") >= 20),
+        ("broken_toolchain", 0.90, n("unique_projects_5m") >= 8 and n("failed_builds_5m") >= 20),
+        ("oom_kill_storm", 0.90, n("oom_kills_5m") >= 5),
+        ("repeated_slow_steps", 0.90, n("slow_steps_5m") >= 5),
+        ("dependency_not_found_storm", 0.85, n("dependency_404_1m") >= 30),
+        ("artifact_bloat", 0.85, n("published_bytes_5m") >= 250_000_000),
+        ("repeated_failure_signatures", 0.90, n("failure_signatures_5m") >= 5),
     ]
 
 
 # Strongest first, table order among equals (a stable sort on -score).
-_ORDER = sorted(range(16), key=lambda i: -_rules({})[i][1])
+_ORDER = sorted(range(len(_rules({}))), key=lambda i: -_rules({})[i][1])
 
 
 def action_for(score):
-    if score >= BLOCK_THRESHOLD:
-        return "block"
+    if score >= QUARANTINE_THRESHOLD:
+        return "quarantine"
     if score >= SUSPICIOUS_THRESHOLD:
         return "alert"
-    return "allow"
+    return "ok"
 
 
 def score_event(e):

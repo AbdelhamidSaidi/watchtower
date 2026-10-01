@@ -1,20 +1,20 @@
 """Accuracy against ground truth, on every event, as it happens.
 
-The producer stamps each event with `scenario` -- "normal" or the attack's
+The producer stamps each event with `scenario` -- "normal" or the incident's
 name -- and the pipeline never reads it. This collector reads security-logs
 as a bystander (no consumer group, from the end), holds each event's truth
 for a few seconds, looks up what the pipeline decided, and counts:
 
   detectors  rules alone (rule_score), the model alone (ml_score) and the
              final decision, each against the truth: flagged or allowed,
-             attack or normal. Precision, recall and false-alarm rate of
+             incident or normal. Precision, recall and false-alarm rate of
              each, over any window, are ratios of these counters.
-  scenarios  the final action per scenario: which attacks are stopped.
+  scenarios  the final action per scenario: which incidents are stopped.
   the model  its own alerts (flagged with no rule behind them) and the
-             decisions it raised above the rules', attack or normal.
-  hosts      normal events blocked on a host that was attacking
+             decisions it raised above the rules', incident or normal.
+  hosts      normal events quarantined on a host that was affected
              (containment) or not (a false positive on an uninvolved host).
-  attacks    one scenario from one source, split on a 60 s pause: caught
+  incidents    one scenario from one source, split on a 60 s pause: caught
              or missed, and the time from its first event to its first flag.
   coverage   events never decided: refused (rejected_events) or missing.
 
@@ -37,7 +37,7 @@ import fastavro
 from core.rules import SUSPICIOUS_THRESHOLD, action_for
 from monitor.exposition import counter, gauge, histogram
 from schemas.registry import SchemaRegistry, unframe
-from tools.evaluate_detection import ATTACK_GAP_MS, CONTAINMENT_MS, SLACK_MS
+from tools.evaluate_detection import INCIDENT_GAP_MS, CONTAINMENT_MS, SLACK_MS
 
 # An event is stored ~0.2-0.4 s after it is produced (docs/capacity-report.md).
 # Looked up after the first delay; still undecided, again after each next
@@ -45,7 +45,7 @@ from tools.evaluate_detection import ATTACK_GAP_MS, CONTAINMENT_MS, SLACK_MS
 DELAYS_S = (10, 10, 40, 60)
 CHUNK = 1000                # event ids per lookup
 POLL_MS = 1000
-RANK = {"allow": 0, "alert": 1, "block": 2}
+RANK = {"ok": 0, "alert": 1, "quarantine": 2}
 TIME_TO_FLAG_S = (0.25, 0.5, 1, 2, 5, 10, 30, 60)
 
 Event = collections.namedtuple("Event", "id scenario source ts partition offset kafka_ts")
@@ -81,13 +81,13 @@ def millis(text):
 
 
 class Run:
-    """One attack in progress: a scenario from one source."""
+    """One incident in progress: a scenario from one source."""
     __slots__ = ("start", "last", "first_flag", "known", "partial")
 
     def __init__(self, ts, known, partial):
         self.start = self.last = ts
         self.first_flag = None
-        self.known = known          # the source attacked within CONTAINMENT_MS before
+        self.known = known          # the source hit within CONTAINMENT_MS before
         self.partial = partial      # already running when the monitor started
 
 
@@ -98,56 +98,56 @@ class Tally:
         self.scenarios = collections.Counter()      # (scenario, action)
         self.detectors = collections.Counter()      # (detector, truth, verdict)
         for detector, truth, verdict in itertools.product(
-                ("rules", "model", "final"), ("attack", "normal"), ("flagged", "allowed")):
+                ("rules", "model", "final"), ("incident", "normal"), ("flagged", "allowed")):
             self.detectors[(detector, truth, verdict)] = 0
-        self.model_only = collections.Counter({"attack": 0, "normal": 0})
-        self.raised = collections.Counter({"attack": 0, "normal": 0})
-        self.normal_blocked = collections.Counter({"attacking": 0, "uninvolved": 0})
+        self.model_only = collections.Counter({"incident": 0, "normal": 0})
+        self.raised = collections.Counter({"incident": 0, "normal": 0})
+        self.normal_quarantined = collections.Counter({"affected": 0, "uninvolved": 0})
         self.undecided = collections.Counter({"missing": 0})
-        self.attacks = collections.Counter()        # (scenario, outcome)
+        self.incidents = collections.Counter()        # (scenario, outcome)
         self.time_to_flag = {known: [0] * (len(TIME_TO_FLAG_S) + 1) for known in ("false", "true")}
         self.time_to_flag_sum = {"false": 0.0, "true": 0.0}
         self.copies = 0
         self.runs = {}              # (scenario, source) -> Run
-        self.last_attack = {}       # source -> ts of its newest attack event
+        self.last_incident = {}       # source -> ts of its newest incident event
         self.first_ts = None
         self.newest = 0
 
     def decided(self, event, action, rule_score, ml_score, model, copies=1):
-        attack = event.scenario != "normal"
-        truth = "attack" if attack else "normal"
+        incident = event.scenario != "normal"
+        truth = "incident" if incident else "normal"
         self.copies += copies - 1
         self.newest = max(self.newest, event.ts)
         if self.first_ts is None:
             self.first_ts = event.ts
         self.scenarios[(event.scenario, action)] += 1
 
-        verdicts = {"rules": rule_score >= SUSPICIOUS_THRESHOLD, "final": action != "allow"}
+        verdicts = {"rules": rule_score >= SUSPICIOUS_THRESHOLD, "final": action != "ok"}
         if model:
             verdicts["model"] = ml_score >= SUSPICIOUS_THRESHOLD
         for detector, flagged in verdicts.items():
             self.detectors[(detector, truth, "flagged" if flagged else "allowed")] += 1
         # Flagged with no rule behind it: the model's decision alone.
-        if action != "allow" and rule_score < SUSPICIOUS_THRESHOLD:
+        if action != "ok" and rule_score < SUSPICIOUS_THRESHOLD:
             self.model_only[truth] += 1
         if RANK.get(action, 0) > RANK[action_for(rule_score)]:
             self.raised[truth] += 1
 
-        if attack:
-            self._attack_event(event, action != "allow")
-        elif action == "block":
-            last = self.last_attack.get(event.source)
+        if incident:
+            self._incident_event(event, action != "ok")
+        elif action == "quarantine":
+            last = self.last_incident.get(event.source)
             contained = last is not None and event.ts - last <= CONTAINMENT_MS
-            self.normal_blocked["attacking" if contained else "uninvolved"] += 1
+            self.normal_quarantined["affected" if contained else "uninvolved"] += 1
 
-    def _attack_event(self, event, flagged):
+    def _incident_event(self, event, flagged):
         key = (event.scenario, event.source)
         run = self.runs.get(key)
-        if run is not None and event.ts - run.last > ATTACK_GAP_MS:
+        if run is not None and event.ts - run.last > INCIDENT_GAP_MS:
             self._close(key, run)
             run = None
         if run is None:
-            last = self.last_attack.get(event.source)
+            last = self.last_incident.get(event.source)
             run = self.runs[key] = Run(
                 event.ts,
                 known=last is not None and event.ts - last <= CONTAINMENT_MS,
@@ -156,7 +156,7 @@ class Tally:
                 partial=event.ts - self.first_ts < 5_000,
             )
         run.last = max(run.last, event.ts)
-        self.last_attack[event.source] = max(self.last_attack.get(event.source, 0), event.ts)
+        self.last_incident[event.source] = max(self.last_incident.get(event.source, 0), event.ts)
         if flagged and run.first_flag is None:
             run.first_flag = event.ts
             if not run.partial:
@@ -168,18 +168,18 @@ class Tally:
         self.time_to_flag_sum[known] += seconds
 
     def _close(self, key, run):
-        self.attacks[(key[0], "caught" if run.first_flag is not None else "missed")] += 1
+        self.incidents[(key[0], "caught" if run.first_flag is not None else "missed")] += 1
         del self.runs[key]
 
     def close_quiet(self):
-        """End the attacks that paused longer than ATTACK_GAP_MS; forget
-        sources whose last attack is out of containment range."""
+        """End the incidents that paused longer than INCIDENT_GAP_MS; forget
+        sources whose last incident is out of containment range."""
         for key, run in list(self.runs.items()):
-            if self.newest - run.last > ATTACK_GAP_MS:
+            if self.newest - run.last > INCIDENT_GAP_MS:
                 self._close(key, run)
-        for source, ts in list(self.last_attack.items()):
+        for source, ts in list(self.last_incident.items()):
             if self.newest - ts > CONTAINMENT_MS:
-                del self.last_attack[source]
+                del self.last_incident[source]
 
     def families(self):
         f = []
@@ -208,10 +208,10 @@ class Tally:
             raised.add(n, truth=truth)
         f.append(raised)
 
-        nb = counter("watchtower_normal_blocked_total",
-                     "Normal events blocked: on a host attacking within the last 5 minutes (containment) "
+        nb = counter("watchtower_normal_quarantined_total",
+                     "Normal events quarantined: on a host affected within the last 5 minutes (containment) "
                      "or on an uninvolved one (a false positive).")
-        for host, n in sorted(self.normal_blocked.items()):
+        for host, n in sorted(self.normal_quarantined.items()):
             nb.add(n, host=host)
         f.append(nb)
 
@@ -225,20 +225,20 @@ class Tally:
                          "Extra stored copies of judged events (at-least-once delivery, before merges fold them).")
                  .add(self.copies))
 
-        att = counter("watchtower_attacks_total",
-                      "Attacks (a scenario from one source, split on a 60 s pause) that ended, caught or missed.")
-        for (scenario, outcome), n in sorted(self.attacks.items()):
+        att = counter("watchtower_incidents_total",
+                      "Incidents (a scenario from one source, split on a 60 s pause) that ended, caught or missed.")
+        for (scenario, outcome), n in sorted(self.incidents.items()):
             att.add(n, scenario=scenario, outcome=outcome)
         f.append(att)
-        f.append(gauge("watchtower_attacks_open", "Attacks in progress.").add(len(self.runs)))
+        f.append(gauge("watchtower_incidents_open", "Incidents in progress.").add(len(self.runs)))
 
         ttf = None
         for known in ("false", "true"):
             counts = self.time_to_flag[known]
             cumulative = list(itertools.accumulate(counts[:-1]))
-            h = histogram("watchtower_attack_time_to_flag_seconds",
-                          "From an attack's first event to its first flag. known_source: the source "
-                          "attacked in the 5 minutes before, so it was already under suspicion.",
+            h = histogram("watchtower_incident_time_to_flag_seconds",
+                          "From an incident's first event to its first flag. known_source: the source "
+                          "hit in the 5 minutes before, so it was already under suspicion.",
                           TIME_TO_FLAG_S, cumulative, self.time_to_flag_sum[known], sum(counts),
                           known_source=known)
             if ttf is None:
@@ -309,7 +309,7 @@ class GroundTruth:
                     self.messages["invalid_id"] += 1    # refused by the pipeline, unjoinable here
                     continue
                 self.messages["labelled"] += 1
-                events.append(Event(event_id, record["scenario"], record.get("source_ip") or "",
+                events.append(Event(event_id, record["scenario"], record.get("runner_ip") or "",
                                     millis(record.get("timestamp")) or message.timestamp,
                                     tp.partition, message.offset, message.timestamp))
         if events:

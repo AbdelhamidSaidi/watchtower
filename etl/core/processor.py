@@ -5,7 +5,7 @@
     features   the rolling 5-minute window (core/window.py)
     rules      deterministic detection (core/rules.py)
 
-One SourceState per source_ip. Storage is pluggable: plain Python here
+One SourceState per runner_ip. Storage is pluggable: plain Python here
 (tests), Flink keyed state in stream/job.py -- where every
 operation touches one state entry, so the per-event cost does not grow
 with the window.
@@ -64,7 +64,7 @@ class MemorySeen:
 
 
 class SourceState:
-    """One source_ip's window plus the event_ids it sent recently. Storage
+    """One runner_ip's window plus the event_ids it sent recently. Storage
     is pluggable: in memory here, Flink keyed state in the job."""
 
     def __init__(self, window_store=None, seen=None, model=None):

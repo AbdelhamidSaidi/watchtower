@@ -16,6 +16,12 @@
 #   docker compose --profile sim up -d   ...or the producer as a container
 #   make monitor-up  Prometheus + Grafana + the auditor (profile: monitoring)
 
+# Pinned, not taken from the folder name: the volumes (watchtower_kafka-data,
+# watchtower_clickhouse-data, ...) were created under this name, and the
+# project folder was renamed to sekera-pipeline. Without it, compose would
+# start a second, empty stack.
+name: watchtower
+
 services:
   kafka:
     image: apache/kafka:4.3.1

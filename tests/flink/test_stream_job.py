@@ -28,7 +28,7 @@ pytestmark = pytest.mark.flink
 
 T0 = datetime(2026, 9, 20, 14, 0, 0, tzinfo=timezone.utc)
 KAFKA_TS = datetime(2026, 9, 20, 14, 5, 0, 250000, tzinfo=timezone.utc)
-ATTACKER = "45.134.26.7"
+CULPRIT = "10.0.14.16"
 
 
 def _run(messages, versions):
@@ -66,10 +66,10 @@ def _run(messages, versions):
 
 @pytest.fixture(scope="module")
 def result(schema_json):
-    burst = [make_event(source_ip=ATTACKER, event_type="LOGIN_FAILURE", user="root",
-                        reason="invalid_password", timestamp=(T0 + timedelta(seconds=i)).isoformat())
+    burst = [make_event(runner_ip=CULPRIT, event_type="BUILD_FAILURE", project="payments-api",
+                        reason="compile_error", timestamp=(T0 + timedelta(seconds=i)).isoformat())
              for i in range(30)]
-    normal = [make_event(source_ip=f"192.168.1.{i}", event_type="FILE_ACCESS",
+    normal = [make_event(runner_ip=f"192.168.1.{i}", event_type="BUILD_SUCCESS",
                          timestamp=(T0 + timedelta(seconds=i)).isoformat()) for i in range(10)]
     messages = [encode(e) for e in burst + normal]
     messages += [encode(burst[3]), encode(burst[4])]          # Kafka redelivery
@@ -82,17 +82,17 @@ def test_every_valid_event_is_scored_once(result):
     assert len({r["event_id"] for r in result["scored"]}) == 40
 
 
-def test_keyed_state_carries_the_burst_to_a_block(result):
-    attacker = sorted((r for r in result["scored"] if r["source_ip"] == ATTACKER),
+def test_keyed_state_carries_the_burst_to_a_quarantine(result):
+    culprit = sorted((r for r in result["scored"] if r["runner_ip"] == CULPRIT),
                       key=lambda r: r["timestamp"])
-    assert [r["failed_logins_1m"] for r in attacker] == list(range(1, 31))
-    assert attacker[18]["recommended_action"] == "allow"
-    assert all(r["recommended_action"] == "block" for r in attacker[19:])
+    assert [r["failed_builds_1m"] for r in culprit] == list(range(1, 31))
+    assert culprit[18]["recommended_action"] == "ok"
+    assert all(r["recommended_action"] == "quarantine" for r in culprit[19:])
 
 
-def test_normal_traffic_is_allowed(result):
-    normal = [r for r in result["scored"] if r["source_ip"] != ATTACKER]
-    assert {r["recommended_action"] for r in normal} == {"allow"}
+def test_normal_traffic_is_ok(result):
+    normal = [r for r in result["scored"] if r["runner_ip"] != CULPRIT]
+    assert {r["recommended_action"] for r in normal} == {"ok"}
 
 
 def test_rejects_go_to_the_side_output_with_their_reason(result):

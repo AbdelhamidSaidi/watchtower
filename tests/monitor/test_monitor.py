@@ -12,9 +12,9 @@ from monitor import procfs  # noqa: E402
 from monitor.exposition import Registry, counter, gauge, histogram  # noqa: E402
 from monitor.stored import Stored  # noqa: E402
 from monitor.truth import Event, Tally  # noqa: E402
-from tools.evaluate_detection import ATTACK_GAP_MS, CONTAINMENT_MS  # noqa: E402
+from tools.evaluate_detection import INCIDENT_GAP_MS, CONTAINMENT_MS  # noqa: E402
 
-HOSTILE = "45.134.26.7"
+CULPRIT = "10.0.14.16"
 BYSTANDER = "192.168.3.9"
 T0 = 1_000_000
 
@@ -80,7 +80,7 @@ def test_meminfo_vmstat_pressure_and_cpu():
     ("clickhouse-serv", "/usr/bin/clickhouse-server --config-file=/etc/clickhouse-server/config.xml", "clickhouse"),
     ("postgres", "postgres: airflow airflow 172.18.0.9(41234) idle", "airflow-db"),
     ("airflow", "/usr/python/bin/python3.12 /home/airflow/.local/bin/airflow scheduler", "airflow"),
-    ("python", "python producer/security_log_producer.py", "producer"),
+    ("python", "python producer/build_log_producer.py", "producer"),
     ("python", "python -m monitor", "monitor"),
     ("containerd", "/usr/bin/containerd", "other"),
 ])
@@ -103,28 +103,28 @@ def test_services_rss_sums_processes_and_skips_kernel_threads(tmp_path):
 
 def test_each_detector_is_judged_against_the_truth():
     t = Tally()
-    # An attack the rules missed and the model caught (the model alone alerted).
-    t.decided(event("port_scan", HOSTILE, T0), "alert", rule_score=0.0, ml_score=0.8, model="v1")
+    # An incident the rules missed and the model caught (the model alone alerted).
+    t.decided(event("oom_kill_storm", CULPRIT, T0), "alert", rule_score=0.0, ml_score=0.8, model="v1")
     # Normal traffic the model wrongly scored high; the final decision followed it.
     t.decided(event("normal", BYSTANDER, T0), "alert", rule_score=0.0, ml_score=0.7, model="v1")
-    # An attack a rule blocked; the model agreed.
-    t.decided(event("sql_injection", HOSTILE, T0 + 1), "block", rule_score=0.95, ml_score=0.99, model="v1")
+    # An incident a rule quarantined; the model agreed.
+    t.decided(event("cache_corruption", CULPRIT, T0 + 1), "quarantine", rule_score=0.95, ml_score=0.99, model="v1")
     f = t.families()
     det = "watchtower_detector_events_total"
-    assert value(f, det, detector="rules", truth="attack", verdict="flagged") == 1
-    assert value(f, det, detector="rules", truth="attack", verdict="allowed") == 1
-    assert value(f, det, detector="model", truth="attack", verdict="flagged") == 2
+    assert value(f, det, detector="rules", truth="incident", verdict="flagged") == 1
+    assert value(f, det, detector="rules", truth="incident", verdict="allowed") == 1
+    assert value(f, det, detector="model", truth="incident", verdict="flagged") == 2
     assert value(f, det, detector="model", truth="normal", verdict="flagged") == 1
     assert value(f, det, detector="final", truth="normal", verdict="flagged") == 1
-    assert value(f, "watchtower_model_only_flags_total", truth="attack") == 1
+    assert value(f, "watchtower_model_only_flags_total", truth="incident") == 1
     assert value(f, "watchtower_model_only_flags_total", truth="normal") == 1
     assert value(f, "watchtower_model_raised_total", truth="normal") == 1
-    assert value(f, "watchtower_truth_decisions_total", scenario="sql_injection", action="block") == 1
+    assert value(f, "watchtower_truth_decisions_total", scenario="cache_corruption", action="quarantine") == 1
 
 
 def test_without_a_model_the_model_detector_counts_nothing():
     t = Tally()
-    t.decided(event("normal", BYSTANDER, T0), "allow", rule_score=0.0, ml_score=0.0, model="")
+    t.decided(event("normal", BYSTANDER, T0), "ok", rule_score=0.0, ml_score=0.0, model="")
     f = t.families()
     assert value(f, "watchtower_detector_events_total", detector="model", truth="normal", verdict="allowed") == 0
     assert value(f, "watchtower_detector_events_total", detector="rules", truth="normal", verdict="allowed") == 1
@@ -132,78 +132,78 @@ def test_without_a_model_the_model_detector_counts_nothing():
 
 def test_extra_stored_copies_are_counted():
     t = Tally()
-    t.decided(event("normal", BYSTANDER, T0), "allow", 0.0, 0.1, "v1", copies=3)
+    t.decided(event("normal", BYSTANDER, T0), "ok", 0.0, 0.1, "v1", copies=3)
     assert value(t.families(), "watchtower_truth_duplicate_rows_total") == 2
 
 
-# --- ground truth: attacks and hosts -------------------------------------------
+# --- ground truth: incidents and hosts -------------------------------------------
 
-def test_an_attack_is_caught_and_timed_from_its_first_event():
+def test_an_incident_is_caught_and_timed_from_its_first_event():
     t = Tally()
-    t.decided(event("normal", BYSTANDER, T0), "allow", 0.0, 0.0, "v1")          # the monitor starts here
+    t.decided(event("normal", BYSTANDER, T0), "ok", 0.0, 0.0, "v1")          # the monitor starts here
     start = T0 + 60_000
     for i in range(5):
-        t.decided(event("ssh_brute_force", HOSTILE, start + i * 500), "block" if i >= 3 else "allow",
+        t.decided(event("retry_storm", CULPRIT, start + i * 500), "quarantine" if i >= 3 else "ok",
                   0.9 if i >= 3 else 0.0, 0.0, "v1")
-    t.decided(event("normal", BYSTANDER, start + ATTACK_GAP_MS + 10_000), "allow", 0.0, 0.0, "v1")
+    t.decided(event("normal", BYSTANDER, start + INCIDENT_GAP_MS + 10_000), "ok", 0.0, 0.0, "v1")
     t.close_quiet()
     f = t.families()
-    assert value(f, "watchtower_attacks_total", scenario="ssh_brute_force", outcome="caught") == 1
-    ttf = samples(f, "watchtower_attack_time_to_flag_seconds")
+    assert value(f, "watchtower_incidents_total", scenario="retry_storm", outcome="caught") == 1
+    ttf = samples(f, "watchtower_incident_time_to_flag_seconds")
     assert ttf[("_count", (("known_source", "false"),))] == 1
     assert ttf[("_sum", (("known_source", "false"),))] == 1.5
     assert ttf[("_bucket", (("known_source", "false"), ("le", "1.0")))] == 0
     assert ttf[("_bucket", (("known_source", "false"), ("le", "2.0")))] == 1
 
 
-def test_an_attack_never_flagged_is_missed_once_it_pauses():
+def test_an_incident_never_flagged_is_missed_once_it_pauses():
     t = Tally()
-    t.decided(event("normal", BYSTANDER, T0), "allow", 0.0, 0.0, "v1")
-    t.decided(event("data_exfiltration", HOSTILE, T0 + 10_000), "allow", 0.0, 0.1, "v1")
+    t.decided(event("normal", BYSTANDER, T0), "ok", 0.0, 0.0, "v1")
+    t.decided(event("artifact_bloat", CULPRIT, T0 + 10_000), "ok", 0.0, 0.1, "v1")
     t.close_quiet()
     f = t.families()
-    assert samples(f, "watchtower_attacks_total") == {}         # still running: not judged yet
-    assert value(f, "watchtower_attacks_open") == 1
-    t.decided(event("normal", BYSTANDER, T0 + 10_000 + ATTACK_GAP_MS + 1), "allow", 0.0, 0.0, "v1")
+    assert samples(f, "watchtower_incidents_total") == {}         # still running: not judged yet
+    assert value(f, "watchtower_incidents_open") == 1
+    t.decided(event("normal", BYSTANDER, T0 + 10_000 + INCIDENT_GAP_MS + 1), "ok", 0.0, 0.0, "v1")
     t.close_quiet()
     f = t.families()
-    assert value(f, "watchtower_attacks_total", scenario="data_exfiltration", outcome="missed") == 1
-    assert value(f, "watchtower_attacks_open") == 0
+    assert value(f, "watchtower_incidents_total", scenario="artifact_bloat", outcome="missed") == 1
+    assert value(f, "watchtower_incidents_open") == 0
 
 
-def test_a_pause_splits_attacks_and_the_second_comes_from_a_known_source():
+def test_a_pause_splits_incidents_and_the_second_comes_from_a_known_source():
     t = Tally()
-    t.decided(event("normal", BYSTANDER, T0), "allow", 0.0, 0.0, "v1")
+    t.decided(event("normal", BYSTANDER, T0), "ok", 0.0, 0.0, "v1")
     first = T0 + 60_000
-    t.decided(event("port_scan", HOSTILE, first), "block", 0.9, 0.0, "v1")
-    second = first + ATTACK_GAP_MS + 30_000
-    t.decided(event("port_scan", HOSTILE, second), "block", 0.9, 0.0, "v1")
+    t.decided(event("oom_kill_storm", CULPRIT, first), "quarantine", 0.9, 0.0, "v1")
+    second = first + INCIDENT_GAP_MS + 30_000
+    t.decided(event("oom_kill_storm", CULPRIT, second), "quarantine", 0.9, 0.0, "v1")
     f = t.families()
-    assert value(f, "watchtower_attacks_total", scenario="port_scan", outcome="caught") == 1
-    ttf = samples(f, "watchtower_attack_time_to_flag_seconds")
+    assert value(f, "watchtower_incidents_total", scenario="oom_kill_storm", outcome="caught") == 1
+    ttf = samples(f, "watchtower_incident_time_to_flag_seconds")
     assert ttf[("_count", (("known_source", "false"),))] == 1
     assert ttf[("_count", (("known_source", "true"),))] == 1
 
 
-def test_attacks_already_running_when_the_monitor_started_are_not_timed():
+def test_incidents_already_running_when_the_monitor_started_are_not_timed():
     t = Tally()
-    t.decided(event("web_scan", HOSTILE, T0), "allow", 0.0, 0.0, "v1")
-    t.decided(event("web_scan", HOSTILE, T0 + 900), "block", 0.85, 0.0, "v1")
-    ttf = samples(t.families(), "watchtower_attack_time_to_flag_seconds")
+    t.decided(event("dependency_not_found", CULPRIT, T0), "ok", 0.0, 0.0, "v1")
+    t.decided(event("dependency_not_found", CULPRIT, T0 + 900), "quarantine", 0.85, 0.0, "v1")
+    ttf = samples(t.families(), "watchtower_incident_time_to_flag_seconds")
     assert ttf[("_count", (("known_source", "false"),))] == 0
 
 
-def test_blocking_an_attacking_hosts_normal_traffic_is_containment():
+def test_quarantining_an_affected_runners_normal_traffic_is_containment():
     t = Tally()
-    t.decided(event("normal", BYSTANDER, T0), "allow", 0.0, 0.0, "v1")
-    attack = T0 + 60_000
-    t.decided(event("lateral_movement", "192.168.1.62", attack), "block", 0.9, 0.0, "v1")
-    t.decided(event("normal", "192.168.1.62", attack + CONTAINMENT_MS - 1), "block", 0.9, 0.0, "v1")
-    t.decided(event("normal", "192.168.1.62", attack + CONTAINMENT_MS + 1), "block", 0.9, 0.0, "v1")
-    t.decided(event("normal", BYSTANDER, attack), "block", 0.9, 0.0, "v1")
+    t.decided(event("normal", BYSTANDER, T0), "ok", 0.0, 0.0, "v1")
+    incident = T0 + 60_000
+    t.decided(event("slow_compile", "192.168.1.62", incident), "quarantine", 0.9, 0.0, "v1")
+    t.decided(event("normal", "192.168.1.62", incident + CONTAINMENT_MS - 1), "quarantine", 0.9, 0.0, "v1")
+    t.decided(event("normal", "192.168.1.62", incident + CONTAINMENT_MS + 1), "quarantine", 0.9, 0.0, "v1")
+    t.decided(event("normal", BYSTANDER, incident), "quarantine", 0.9, 0.0, "v1")
     f = t.families()
-    assert value(f, "watchtower_normal_blocked_total", host="attacking") == 1
-    assert value(f, "watchtower_normal_blocked_total", host="uninvolved") == 2
+    assert value(f, "watchtower_normal_quarantined_total", host="affected") == 1
+    assert value(f, "watchtower_normal_quarantined_total", host="uninvolved") == 2
 
 
 # --- stored ------------------------------------------------------------------
@@ -229,18 +229,18 @@ class FakeClickHouse:
 
 
 def test_stored_counts_each_window_once_and_accumulates_histograms():
-    rows = [{"action": "block", "model": "v1", "decided_by": "rules", "n": 3, "latency_sum": 900,
+    rows = [{"action": "quarantine", "model": "v1", "decided_by": "rules", "n": 3, "latency_sum": 900,
              "latency_le": [0, 1] + [3] * 16, "scored": 3, "score_le": [0] * 19 + [3], "score_sum": 2.9},
-            {"action": "allow", "model": "v1", "decided_by": "none", "n": 1, "latency_sum": 100,
+            {"action": "ok", "model": "v1", "decided_by": "none", "n": 1, "latency_sum": 100,
              "latency_le": [0, 0, 1] + [1] * 15, "scored": 1, "score_le": [1] * 20, "score_sum": 0.01}]
     stored = Stored(FakeClickHouse(rows))
     stored.collect()                    # the first pass only sets where counting starts
     f = stored.collect()
-    assert value(f, "watchtower_stored_events_total", action="block", model="v1", decided_by="rules") == 3
+    assert value(f, "watchtower_stored_events_total", action="quarantine", model="v1", decided_by="rules") == 3
     assert value(f, "watchtower_refused_messages_total", reason="invalid_event_id") == 1
     lat = samples(f, "watchtower_e2e_latency_ms")
     assert lat[("_count", ())] == 4 and lat[("_sum", ())] == 1000
     assert lat[("_bucket", (("le", "50.0"),))] == 1 and lat[("_bucket", (("le", "100.0"),))] == 4
     assert value(f, "watchtower_e2e_latency_last_minute_ms", stat="p95") == 300
     f = stored.collect()
-    assert value(f, "watchtower_stored_events_total", action="block", model="v1", decided_by="rules") == 6
+    assert value(f, "watchtower_stored_events_total", action="quarantine", model="v1", decided_by="rules") == 6

@@ -100,7 +100,7 @@ render:  ## Render both overlays -- catches broken manifests without a cluster
 	done
 
 .PHONY: schema-check
-schema-check:  ## Is schemas/security_event.avsc compatible with the registry? (dev registry)
+schema-check:  ## Is schemas/build_event.avsc compatible with the registry? (dev registry)
 	python3 tools/schema_registry.py check --url http://localhost:8081
 
 .PHONY: ci
@@ -176,7 +176,7 @@ ch-relayout:  ## Move an existing security_events onto the 01_schema.sql layout 
 	python3 tools/relayout_security_events.py
 
 .PHONY: ch-bench
-ch-bench:  ## Benchmark the analyst/evaluator/latency queries: make ch-bench TABLES="security_events"
+ch-bench:  ## Benchmark the engineer/evaluator/latency queries: make ch-bench TABLES="security_events"
 	python3 tools/bench_queries.py $${TABLES:-security_events}
 
 .PHONY: ch-migrate-k8s
@@ -195,13 +195,13 @@ pipeline-health:  ## The latest end-to-end verdict from Airflow, stage by stage 
 	  ORDER BY stage, check_name FORMAT PrettyCompactMonoBlock"'
 
 .PHONY: evaluate
-evaluate:  ## Detection vs ground truth: allow/alert/block per scenario (dev)
+evaluate:  ## Detection vs ground truth: ok/alert/quarantine per scenario (dev)
 	python3 tools/evaluate_detection.py --minutes $${MINUTES:-15}
 
 .PHONY: produce
 produce:  ## Synthetic traffic from the host (Ctrl-C to stop)
 	KAFKA_BROKER=localhost:9092 SCHEMA_REGISTRY_URL=http://localhost:8081 \
-	  python3 producer/security_log_producer.py
+	  python3 producer/build_log_producer.py
 
 ##@ Kubernetes (k3d)
 

@@ -1,8 +1,8 @@
 {
   "type": "record",
-  "name": "SecurityEvent",
+  "name": "BuildEvent",
   "namespace": "io.watchtower.events",
-  "doc": "One security event as emitted by a producer or agent. Registered under subject security-logs-value with BACKWARD compatibility: a new version may only add fields that carry a default. v2 adds request, network, process and file context -- enough to tell a bad request from a normal one, not just to count events.",
+  "doc": "One build-farm event as emitted by a build agent: a build starting or finishing, a compiler invocation, a test run, a dependency fetch, an artifact upload. Registered under subject security-logs-value (the name predates the compilation-log pivot and is kept so topics, tables and the registry stay put) with BACKWARD compatibility: a new version may only add fields that carry a default.",
   "fields": [
     {
       "name": "event_id",
@@ -12,15 +12,17 @@
     {
       "name": "timestamp",
       "type": "string",
-      "doc": "ISO-8601 with offset. Kept as a string: clean.py casts it, so a malformed value is rejected with a reason rather than nulled at decode time"
+      "doc": "ISO-8601 with offset. Kept as a string: the validate step casts it, so a malformed value is rejected with a reason rather than nulled at decode time"
     },
     {
-      "name": "source_ip",
-      "type": "string"
+      "name": "runner_ip",
+      "type": "string",
+      "doc": "The build agent that emitted the event. The stream is keyed by it, so every window feature is about one runner"
     },
     {
-      "name": "user",
-      "type": "string"
+      "name": "project",
+      "type": "string",
+      "doc": "The project being built (repository / module name)"
     },
     {
       "name": "event_type",
@@ -28,7 +30,8 @@
     },
     {
       "name": "hostname",
-      "type": "string"
+      "type": "string",
+      "doc": "The runner's hostname"
     },
     {
       "name": "severity",
@@ -41,7 +44,7 @@
         "string"
       ],
       "default": null,
-      "doc": "LOGIN_FAILURE only"
+      "doc": "BUILD_FAILURE only: compile_error | link_error | test_failure | oom_killed | timeout | dependency_unresolved | toolchain_error"
     },
     {
       "name": "command",
@@ -50,16 +53,16 @@
         "string"
       ],
       "default": null,
-      "doc": "COMMAND_EXECUTION only"
+      "doc": "COMPILE_STEP only: the compiler or linker invocation"
     },
     {
-      "name": "target_port",
+      "name": "exit_code",
       "type": [
         "null",
         "int"
       ],
       "default": null,
-      "doc": "PORT_SCAN only"
+      "doc": "Process exit status (COMPILE_STEP, TEST_RUN, BUILD_FAILURE). 137 is SIGKILL -- what the OOM killer sends"
     },
     {
       "name": "log_source",
@@ -68,7 +71,7 @@
         "string"
       ],
       "default": null,
-      "doc": "Emitting system: sshd, sudo, auditd, nginx, firewall, app"
+      "doc": "Emitting tool: make, ninja, gradle, maven, cargo, npm, go, bazel, registry, jenkins"
     },
     {
       "name": "outcome",
@@ -77,16 +80,16 @@
         "string"
       ],
       "default": null,
-      "doc": "success | failure | denied | allowed"
+      "doc": "success | failure | cancelled | skipped"
     },
     {
-      "name": "session_id",
+      "name": "build_id",
       "type": [
         "null",
         "string"
       ],
       "default": null,
-      "doc": "Correlates events belonging to one session"
+      "doc": "Correlates the events of one build"
     },
     {
       "name": "dest_ip",
@@ -95,7 +98,7 @@
         "string"
       ],
       "default": null,
-      "doc": "Where the connection or request was going"
+      "doc": "Where the fetch or upload went: artifact registry, cache or store"
     },
     {
       "name": "dest_port",
@@ -113,16 +116,16 @@
         "string"
       ],
       "default": null,
-      "doc": "ssh | http | https | tcp | udp"
+      "doc": "https | http | grpc | tcp"
     },
     {
-      "name": "auth_method",
+      "name": "triggered_by",
       "type": [
         "null",
         "string"
       ],
       "default": null,
-      "doc": "password | publickey | mfa | token"
+      "doc": "Who or what started the build: a developer, a CI account, a schedule"
     },
     {
       "name": "http_method",
@@ -131,7 +134,7 @@
         "string"
       ],
       "default": null,
-      "doc": "GET, POST, ..."
+      "doc": "GET, PUT, ..."
     },
     {
       "name": "url_path",
@@ -140,7 +143,7 @@
         "string"
       ],
       "default": null,
-      "doc": "Path AND query string as received, undecoded"
+      "doc": "Path AND query string of a registry request, as received"
     },
     {
       "name": "http_status",
@@ -149,7 +152,7 @@
         "int"
       ],
       "default": null,
-      "doc": "Response status code"
+      "doc": "Registry response status code"
     },
     {
       "name": "user_agent",
@@ -158,7 +161,7 @@
         "string"
       ],
       "default": null,
-      "doc": "Client User-Agent header"
+      "doc": "Client tool and version, e.g. maven/3.9.6"
     },
     {
       "name": "bytes_sent",
@@ -167,7 +170,7 @@
         "long"
       ],
       "default": null,
-      "doc": "Response size -- large sums from one source suggest exfiltration"
+      "doc": "Bytes transferred by the fetch or upload -- large uploads from one runner fill the artifact store"
     },
     {
       "name": "response_time_ms",
@@ -176,7 +179,7 @@
         "int"
       ],
       "default": null,
-      "doc": "Server-side latency"
+      "doc": "Registry latency"
     },
     {
       "name": "process_name",
@@ -185,7 +188,7 @@
         "string"
       ],
       "default": null,
-      "doc": "Executable that ran"
+      "doc": "Executable that ran: gcc, clang++, rustc, javac, ld, ..."
     },
     {
       "name": "process_id",
@@ -203,7 +206,7 @@
         "string"
       ],
       "default": null,
-      "doc": "Parent executable -- sshd -> bash -> sudo is a shape worth seeing"
+      "doc": "Parent executable -- ninja -> clang++ is the usual shape; sh -> curl -> sh is not"
     },
     {
       "name": "process_uid",
@@ -215,22 +218,58 @@
       "doc": "Effective uid. 0 is root. Null means unknown -- never assume root"
     },
     {
+      "name": "step",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "COMPILE_STEP kind: compile | link | archive | codegen"
+    },
+    {
       "name": "file_path",
       "type": [
         "null",
         "string"
       ],
       "default": null,
-      "doc": "File touched"
+      "doc": "Source file or artifact the step worked on"
     },
     {
-      "name": "file_operation",
+      "name": "duration_ms",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "How long the step, test run or build took"
+    },
+    {
+      "name": "peak_memory_mb",
+      "type": [
+        "null",
+        "int"
+      ],
+      "default": null,
+      "doc": "Peak resident memory of the step"
+    },
+    {
+      "name": "cache_status",
       "type": [
         "null",
         "string"
       ],
       "default": null,
-      "doc": "read | write | delete | chmod"
+      "doc": "Build-cache lookup: hit | miss | corrupt"
+    },
+    {
+      "name": "error_message",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "First line of the tool's error output, if any"
     },
     {
       "name": "scenario",
