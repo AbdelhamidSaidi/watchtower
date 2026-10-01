@@ -63,6 +63,9 @@ RUN pip install --no-cache-dir "pytest==9.1.1" \
       --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 COPY --chown=airflow:root tests /opt/watchtower/tests
 COPY --chown=airflow:root pyproject.toml /opt/watchtower/pyproject.toml
+# The live-audit exporter (monitor/) is tested here too: it reuses the
+# evaluator and the training constants this image already carries.
+COPY --chown=airflow:root monitor /opt/watchtower/monitor
 WORKDIR /opt/watchtower
 ENTRYPOINT []
-CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/orchestration"]
+CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/orchestration", "tests/monitor"]

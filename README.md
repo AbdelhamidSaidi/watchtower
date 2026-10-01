@@ -41,9 +41,10 @@ Built for the Sekera Services internship *« Conception d'un pipeline de traitem
 | **Per-event cost** | ~183 µs in the Flink job with the model (~10 µs of it) — 18% of the 1 ms each event has at 1,000/s; ~5,450 events/s per TaskManager |
 | **Detection** (15 min, 879,721 events) | 29 of 29 attacks caught, 99.3% of attack events blocked, every event decided; 7 of 868,112 normal events wrongly blocked on uninvolved hosts |
 | **Learning loop** | hourly AI review → labels → retraining starts on new labels → promoted only if better → picked up by Flink within 5 min, no restart |
+| **The model, live** | its own alerts: 35 of 35 were real attacks (6 min vs ground truth); ~0.1% of events; adds a few ms at p95 at most |
 | **Orchestration** | 6 Airflow DAGs: end-to-end pipeline check (10 min), data quality (hourly), AI review (hourly), training (on new labels + nightly), rollup (daily), detection quality (6-hourly) |
 | **Scaling** | Kubernetes: Flink TaskManagers (5–24 in prod) and Kafka brokers (3–6) autoscale |
-| **Tests** | 83 in the Flink image, 113 in the Airflow image; lint clean |
+| **Tests** | 85 in the Flink image, 113 in the Airflow image; lint clean |
 
 ---
 

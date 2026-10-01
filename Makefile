@@ -76,7 +76,7 @@ image-producer:  ## Build the producer image
 
 .PHONY: lint
 lint: image-flink-test  ## Ruff: pyflakes + syntax errors
-	docker run --rm $(FLINK_TEST) python3 -m ruff check etl tools schemas tests producer orchestration
+	docker run --rm $(FLINK_TEST) python3 -m ruff check etl tools schemas tests producer orchestration monitor
 
 .PHONY: test-unit
 test-unit: image-flink-test  ## Engine-free unit tests (etl/core, config, registry): seconds
@@ -115,7 +115,23 @@ dev-up: secrets image-flink image-producer  ## Start the dev stack (Flink live p
 
 .PHONY: dev-down
 dev-down:  ## Stop the dev stack (keeps volumes)
-	docker compose --profile sim --profile airflow down
+	docker compose --profile sim --profile airflow --profile monitoring down
+
+# Needs no build: Prometheus and Grafana are stock images, the monitor runs
+# the mounted monitor/ on the producer image. ClickHouse is restarted only
+# when it has not opened its Prometheus port yet (9363, 2493 in /proc/net/tcp):
+# config.d is read at start.
+.PHONY: monitor-up
+monitor-up: secrets  ## Prometheus + Grafana + the live-audit exporter; Grafana on :3000
+	@docker exec watchtower-clickhouse grep -qi ':2493 ' /proc/net/tcp /proc/net/tcp6 \
+	  || docker compose up -d --force-recreate --no-deps clickhouse
+	docker compose --profile monitoring up -d --no-deps monitor prometheus grafana
+	@echo "grafana: http://localhost:3000 (live audit; admin / secrets/grafana_admin_password to edit)"
+	@echo "prometheus: http://localhost:9090   exporter: http://localhost:9400/metrics"
+
+.PHONY: monitor-down
+monitor-down:  ## Stop the monitoring stack (keeps its data)
+	docker compose --profile monitoring stop monitor prometheus grafana
 
 # The producer runs at 100/s here, not 1,000: the 1,000/s stack alone fills
 # a ~4 GB Docker VM's swap, and Airflow needs ~0.5 GB while a task runs.

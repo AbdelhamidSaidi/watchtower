@@ -78,6 +78,26 @@ def test_the_model_never_lowers_what_a_rule_decided():
     assert event["ml_reason"] == ""                  # the rules decided, not the model
 
 
+def test_a_higher_score_on_a_rule_decided_block_is_not_the_models_decision(monkeypatch):
+    # A block-level rule fired (brute force, 0.90); the model scores the
+    # event higher still. The decision is the rule's: no ml_reason. Measured
+    # 2026-09-29: 4,051 of 4,254 rule blocks carried a model reason before.
+    monkeypatch.setattr(ml, "ML_CAN_BLOCK", False)
+    event = scored({**NOISY, "failed_logins_1m": 25, "is_night": 1}, ml.Model(DUMP, "v1"))   # model ~0.92
+    assert event["rule_hits"] and event["recommended_action"] == "block"
+    assert event["ml_score"] > event["rule_score"] and event["ml_reason"] == ""
+
+
+def test_raising_an_alert_level_rule_to_block_is_the_models_decision(monkeypatch):
+    # A lone sensitive-path probe alerts (0.70); the model, sure, takes it to
+    # block -- allowed, a rule agrees -- and says why.
+    monkeypatch.setattr(ml, "ML_CAN_BLOCK", False)
+    probe = {**NOISY, "is_internal_ip": 0, "is_sensitive_path": 1, "http_status": 404}
+    event = scored(probe, ml.Model(DUMP, "v1"))
+    assert event["rule_hits"] == "sensitive_path_probe" and event["recommended_action"] == "block"
+    assert event["ml_reason"].startswith("ml: ")
+
+
 def test_a_model_trained_on_other_features_is_refused():
     with pytest.raises(ValueError, match="different features"):
         ml.Model({**DUMP, "feature_names": ["a", "b"]}, "v0")

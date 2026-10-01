@@ -1,0 +1,56 @@
+# Prometheus scrape config for the dev stack (docker compose, profile
+# `monitoring`). The Kubernetes one (prometheus.yml) discovers pods; this
+# one names the compose services -- with the same job names and labels, so
+# alerts.yml and both Grafana dashboards work unchanged in either place.
+#
+# Every 5 s: the audit dashboard is watched live. Two days kept; the TSDB
+# stays small because ClickHouse's ~1,500 series are cut to what is used.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+  - /etc/prometheus/audit-alerts.yml
+
+scrape_configs:
+  # The Flink job. TaskManagers scale (--scale flink-taskmanager=N): Docker's
+  # DNS returns every replica for the service name.
+  - job_name: watchtower-stream
+    static_configs:
+      - targets: [flink-jobmanager:9249]
+        labels: {component: jobmanager}
+    dns_sd_configs:
+      - names: [flink-taskmanager]
+        type: A
+        port: 9249
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: [__meta_dns_name]
+        regex: flink-taskmanager
+        target_label: component
+        replacement: taskmanager
+      - source_labels: [__address__]
+        target_label: pod
+
+  # What the pipeline stored, decided and should have decided (monitor/).
+  - job_name: watchtower-monitor
+    static_configs:
+      - targets: [monitor:9400]
+
+  - job_name: clickhouse
+    static_configs:
+      - targets: [clickhouse:9363]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: >-
+          ClickHouse(AsyncMetrics_(MemoryResident|OSMemoryAvailable|TotalPartsOfMergeTreeTables|MaxPartCountForPartition|Uptime)|Metrics_(MemoryTracking|Merge|Query|BackgroundMergesAndMutationsPoolTask|KafkaConsumers|KafkaConsumersInUse|KafkaAssignedPartitions|PartsActive)|ProfileEvents_(InsertedRows|InsertedBytes|Query|FailedQuery|MergedRows|DelayedInserts|RejectedInserts|KafkaMessagesRead|KafkaRowsRead|KafkaRowsRejected|KafkaCommitFailures|KafkaConsumerErrors))
+        action: keep
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  - job_name: grafana
+    static_configs:
+      - targets: [grafana:3000]

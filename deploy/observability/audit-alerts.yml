@@ -1,0 +1,124 @@
+# Audit rules: the live system judged on what it DECIDED and what it
+# should have decided, from the monitor (monitor/). alerts.yml watches the
+# machinery (is the job up, is it keeping up); these watch the outcome.
+#
+# Loaded by the compose Prometheus (prometheus-compose.yml). The accuracy
+# rules need the synthetic producer's ground truth.
+groups:
+  - name: watchtower-audit
+    rules:
+      - alert: MonitorDown
+        expr: up{job="watchtower-monitor"} == 0 or absent(up{job="watchtower-monitor"})
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: The audit exporter is not answering
+          description: Accuracy, latency and model panels go blank. docker compose logs monitor
+
+      - alert: AttackMissed
+        expr: sum(increase(watchtower_attacks_total{outcome="missed"}[15m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value | humanize }} attack(s) ended without a single flag in 15 min"
+          description: >-
+            An attack ran to its end and every one of its events was
+            allowed. Which: watchtower_attacks_total{outcome="missed"} by
+            scenario, on the audit dashboard.
+
+      - alert: EventsUndecided
+        expr: sum(increase(watchtower_truth_undecided_total{reason="missing"}[10m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value | humanize }} events read from Kafka never got a decision"
+          description: >-
+            Neither stored nor refused 120 s after the monitor read them:
+            lost between Kafka and ClickHouse. Check the Flink job and
+            ClickHouse's Kafka intake.
+
+      - alert: EndToEndLatencyHigh
+        expr: watchtower_e2e_latency_last_minute_ms{stat="p95"} > 2000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 event -> stored latency is {{ $value | humanize }} ms"
+          description: >-
+            Over the 2 s budget. If the VM is swapping (VmSwapping) that is
+            the cause; otherwise compare Kafka -> decision (StreamLatencyHigh).
+
+      - alert: UninvolvedHostsBlocked
+        expr: >-
+          sum(increase(watchtower_normal_blocked_total{host="uninvolved"}[1h]))
+          / clamp_min(sum(increase(watchtower_detector_events_total{detector="final",truth="normal"}[1h])), 1)
+          > 0.0001
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of normal events blocked on hosts that were not attacking"
+          description: >-
+            The detection-quality DAG's threshold (orchestration/ops/detection.py).
+            Blocks on a host that WAS attacking are containment, not counted.
+
+      - alert: ModelAlertsMostlyWrong
+        expr: >-
+          sum(increase(watchtower_model_only_flags_total{truth="normal"}[1h]))
+          / clamp_min(sum(increase(watchtower_model_only_flags_total[1h])), 1) > 0.5
+          and sum(increase(watchtower_model_only_flags_total[1h])) >= 20
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of the model's own alerts in 1 h were normal traffic"
+          description: >-
+            The guard rolls a model back on the same share, judged by the AI
+            reviewer; this is the same question against ground truth.
+
+      - alert: ModelNotServing
+        expr: watchtower_model_serving_matches_active == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Flink is not scoring with the active model
+          description: >-
+            ModelSource picks up a promotion within 5 minutes. After 10 the
+            job cannot read ml_models, or WATCHTOWER_ML=off.
+
+      - alert: CheckpointsStalled
+        expr: watchtower_flink_last_checkpoint_age_seconds > 60
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "No completed checkpoint for {{ $value | humanize }} s (interval 10 s)"
+          description: >-
+            Offsets are not committed and state is not saved: after a crash,
+            everything since the last checkpoint is replayed.
+
+      - alert: ServiceDown
+        expr: watchtower_service_up{service!="airflow"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.service }} is not answering"
+
+      - alert: VmSwapping
+        expr: rate(watchtower_vm_swap_pages_total{direction="in"}[1m]) > 256
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "The Docker VM swaps in {{ $value | humanize }} pages/s"
+          description: >-
+            Swap, not the pipeline, caused every multi-second latency spike
+            measured so far. Stop what is not needed (Airflow, a second
+            TaskManager) or give Docker more memory.
+
+      - alert: VmMemoryPressure
+        expr: watchtower_vm_pressure_avg10_percent{resource="memory",kind="full"} > 5
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Every task stalled on memory {{ $value | humanize }}% of the time"
+
+      - alert: VmOomKill
+        expr: increase(watchtower_vm_oom_kills_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "The kernel killed {{ $value | humanize }} process(es) for memory"
+          description: >-
+            Restart policies bring the service back; its restarts count is on
+            the audit dashboard. Find which: docker compose ps.

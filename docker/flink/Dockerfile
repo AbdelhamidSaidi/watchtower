@@ -64,5 +64,6 @@ COPY --chown=flink:flink tests /opt/watchtower/tests
 COPY --chown=flink:flink tools /opt/watchtower/tools
 COPY --chown=flink:flink producer /opt/watchtower/producer
 COPY --chown=flink:flink orchestration /opt/watchtower/orchestration
+COPY --chown=flink:flink monitor /opt/watchtower/monitor
 WORKDIR /opt/watchtower
 USER flink

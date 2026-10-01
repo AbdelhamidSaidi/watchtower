@@ -137,7 +137,10 @@ def apply(event, model):
     final = max(event["rule_score"], share)
     event["ml_score"] = probability
     event["ml_model"] = model.version
-    changed = share > event["rule_score"] and share >= SUSPICIOUS_THRESHOLD
+    # Explained only when the model changed the DECISION -- allow to alert,
+    # alert to block -- not merely the score: a rule's block that the model
+    # scores higher is still the rule's block.
+    changed = action_for(final) != action_for(event["rule_score"])
     event["ml_reason"] = model.explain(event) if changed else ""
     event["final_anomaly_score"] = final
     event["is_suspicious"] = 1 if final >= SUSPICIOUS_THRESHOLD else 0

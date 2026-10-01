@@ -119,7 +119,10 @@ def collect_labels(start_ms, end_ms, per_source=PER_SOURCE, seed=None):
     schemas = {sid: fastavro.parse_schema(json.loads(text))
                for sid, text in SchemaRegistry(config.SCHEMA_REGISTRY_URL).all_versions(DEFAULT_SUBJECT).items()}
     consumer = KafkaConsumer(bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS, enable_auto_commit=False)
-    normals = NormalSampler(per_source, random.Random(seed))
+    # Seeded by the window: the same hour always gives the same sample, so a
+    # re-run or backfill writes the same rows, which training_labels folds
+    # (ReplacingMergeTree on event_id, source) -- never a second sample.
+    normals = NormalSampler(per_source, random.Random(start_ms if seed is None else seed))
     rows = []
     try:
         partitions = [TopicPartition(config.KAFKA_TOPIC, p) for p in consumer.partitions_for_topic(config.KAFKA_TOPIC)]

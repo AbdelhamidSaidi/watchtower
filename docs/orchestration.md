@@ -126,6 +126,9 @@ stands for. A uniform 2% sample was tried first and left quiet hosts —
 the remote staff — so thin that a model learned "external IP + data
 volume" as an attack and alerted on every VPN user; per source, every
 host is in the data, and the weights still add up to the real traffic.
+The sample is seeded by the hour it covers, so a re-run or backfill of an
+hour writes exactly the same rows — `training_labels` folds them — and
+never adds a second sample that would double that hour's weight.
 
 *The gate.* The holdout is chosen by a hash of the event (a rerun splits
 the same way) and never contains a reviewer label: judging a model on
